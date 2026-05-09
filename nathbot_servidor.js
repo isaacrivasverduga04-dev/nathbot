@@ -1,6 +1,6 @@
 // ╔══════════════════════════════════════════════════════╗
-// ║          NATHBOT v3 — Sistema completo               ║
-// ║  Imágenes ✓  Audio ✓  Memoria persistente ✓         ║
+// ║          NATHBOT v4 — Sistema sólido                 ║
+// ║  Bodas ✓  Cobros ✓  Metas ✓  Leads ✓  Finanzas ✓   ║
 // ╚══════════════════════════════════════════════════════╝
 const env = require('dotenv').config().parsed || {};
 const getEnv = (k) => process.env[k] || env[k];
@@ -26,7 +26,7 @@ const NATH_NUM = getEnv('NATH_WHATSAPP_NUMBER');
 const historialCache = {};
 const MAX_MENSAJES = 20;
 
-// ── Keep-alive: se hace ping a sí mismo cada 10 min para no dormir ────────────
+// ── Keep-alive: ping cada 10 min para no dormir en Render free tier ───────────
 const SELF_URL = getEnv('RENDER_EXTERNAL_URL') || 'https://nathbot-0gxu.onrender.com';
 setInterval(() => {
   const lib = SELF_URL.startsWith('https') ? https : http;
@@ -54,6 +54,13 @@ async function leerHoja(sheets, hoja, rango = 'A1:Z200') {
   } catch { return []; }
 }
 
+async function leerFilasBrutas(sheets, hoja, rango = 'A1:Z200') {
+  try {
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEETS_ID, range: `${hoja}!${rango}` });
+    return res.data.values || [];
+  } catch { return []; }
+}
+
 async function agregarFila(sheets, hoja, valores) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEETS_ID, range: `${hoja}!A1`,
@@ -68,13 +75,19 @@ async function actualizarCelda(sheets, hoja, rango, valor) {
   });
 }
 
+// Convierte número serial de Excel/Sheets a fecha legible
+function serialAFecha(serial) {
+  if (!serial || isNaN(serial)) return serial || '';
+  const d = new Date((parseFloat(serial) - 25569) * 86400000);
+  return d.toISOString().split('T')[0];
+}
+
 // ── Descargar imagen de Twilio como base64 ────────────────────────────────────
 function descargarImagenBase64(url) {
   return new Promise((resolve, reject) => {
     const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, { headers: { Authorization: `Basic ${auth}` } }, (res) => {
-      // Seguir redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return descargarImagenBase64(res.headers.location).then(resolve).catch(reject);
       }
@@ -110,18 +123,14 @@ async function descargarBuffer(url) {
 async function transcribirAudio(mediaUrl) {
   try {
     const OPENAI_KEY = getEnv('OPENAI_API_KEY');
-    if (!OPENAI_KEY) return null; // Sin key de OpenAI, no transcribimos
-
+    if (!OPENAI_KEY) return null;
     const { buffer, contentType } = await descargarBuffer(mediaUrl);
     const ext = contentType?.includes('ogg') ? 'ogg' : contentType?.includes('mp4') ? 'mp4' : 'mp3';
-
-    // Llamar a Whisper via fetch (no depende de SDK de OpenAI)
     const FormData = require('form-data');
     const form = new FormData();
     form.append('file', buffer, { filename: `audio.${ext}`, contentType: contentType || 'audio/ogg' });
     form.append('model', 'whisper-1');
     form.append('language', 'es');
-
     const response = await new Promise((resolve, reject) => {
       const postData = form.getBuffer();
       const options = {
@@ -137,7 +146,6 @@ async function transcribirAudio(mediaUrl) {
       req.write(postData);
       req.end();
     });
-
     return response.text || null;
   } catch (e) {
     console.log('⚠️ Error transcribiendo audio:', e.message);
@@ -147,63 +155,89 @@ async function transcribirAudio(mediaUrl) {
 
 // ── Contexto del negocio desde Sheets ────────────────────────────────────────
 async function construirContexto(sheets) {
-  const [bodas, tareas, finanzas, meDeben, metas, contenido, leads, proyectos] = await Promise.all([
+  const [bodas, tareas, finanzas, meDeben, debo, metas, contenido, leads, proyectos] = await Promise.all([
     leerHoja(sheets, 'BODAS'),
     leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
     leerHoja(sheets, 'FINANZAS', 'A1:E100'),
-    leerHoja(sheets, 'ME DEBEN', 'A1:E50'),
+    leerHoja(sheets, 'ME DEBEN', 'A1:E100'),
+    leerHoja(sheets, 'DEBO', 'A1:E100'),
     leerHoja(sheets, 'METAS', 'A1:F50'),
     leerHoja(sheets, 'CONTENIDO', 'A1:H50'),
-    leerHoja(sheets, 'LEADS', 'A1:H50'),
-    leerHoja(sheets, 'PROYECTOS', 'A1:H50'),
+    leerHoja(sheets, 'LEADS', 'A1:F50'),
+    leerHoja(sheets, 'PROYECTOS', 'A1:J50'),
   ]);
 
   const hoy = new Date().toLocaleDateString('es-BO');
 
+  // Cobros: ME DEBEN + saldos de BODAS no duplicados
+  const cobrosDirectos = meDeben.filter(d => d['Estado'] === 'Pendiente').map(c =>
+    `- ${c['Quien'] || '?'}: ${c['Monto (BOB)']} BOB — ${c['Concepto'] || ''}`
+  );
+  const parejasMeDeben = new Set(meDeben.map(d => (d['Quien'] || '').toLowerCase()));
+  const saldosTotalesMeDeben = meDeben.filter(d => d['Estado'] === 'Pendiente')
+    .reduce((s, d) => s + parseFloat(d['Monto (BOB)'] || 0), 0);
+  const saldosTotalesDebo = debo.filter(d => d['Estado'] === 'Pendiente')
+    .reduce((s, d) => s + parseFloat(d['Monto (BOB)'] || 0), 0);
+
+  // Calcular ingresos y gastos del mes actual
+  const mesActual = new Date().toISOString().slice(0, 7);
+  const ingresosMes = finanzas.filter(f => f['Tipo'] === 'Ingreso' && (f['Fecha'] || '').startsWith(mesActual))
+    .reduce((s, f) => s + parseFloat(f['Monto (BOB)'] || 0), 0);
+  const gastosMes = finanzas.filter(f => f['Tipo'] === 'Gasto' && (f['Fecha'] || '').startsWith(mesActual))
+    .reduce((s, f) => s + parseFloat(f['Monto (BOB)'] || 0), 0);
+
   return `HOY: ${hoy}
 
 BODAS ACTIVAS:
-${bodas.filter(b => b['Estado'] !== 'Completado').map(b =>
-    `- ${b['Pareja'] || b['Nombre'] || '?'} | ${b['Estado']} | Saldo: ${b['Saldo pendiente'] || b['Saldo pendiente (BOB)'] || 0} BOB | Boda: ${b['Fecha de boda'] || '?'}`
-  ).join('\n') || 'Ninguna'}
+${bodas.filter(b => b['Estado'] && !b['Estado'].match(/completad/i)).map(b => {
+  const fecha = serialAFecha(b['Fecha de boda']);
+  return `- ${b['Pareja'] || '?'} | ${b['Estado']} | Saldo: ${b['Saldo pendiente'] || 0} BOB | Boda: ${fecha || '?'} | Pendiente: ${b['Entregas pendientes'] || 'nada'}`;
+}).join('\n') || 'Ninguna'}
 
 PROYECTOS ACTIVOS:
-${proyectos.filter(p => p['Estado'] !== 'Completado').slice(0, 8).map(p =>
-    `- ${p['Nombre'] || p['Proyecto'] || '?'} | ${p['Estado'] || '?'} | ${p['Cliente'] || ''}`
-  ).join('\n') || 'Ninguno'}
+${proyectos.filter(p => p['Estado'] && !p['Estado'].match(/completad/i)).slice(0, 6).map(p => {
+  const fecha = serialAFecha(p['Fecha de boda']);
+  return `- ${p['Pareja'] || p['Nombre'] || '?'} | ${p['Estado'] || '?'} | Saldo: ${p['Saldo pendiente (BOB)'] || 0} BOB | Boda: ${fecha || '?'}`;
+}).join('\n') || 'Ninguno'}
 
-TAREAS PENDIENTES:
-${tareas.filter(t => t['Completada'] !== 'Sí').slice(0, 10).map(t =>
-    `- [${t['Prioridad'] || 'Normal'}] ${t['Tarea'] || '?'} | ${t['Categoria'] || ''}`
-  ).join('\n') || 'Ninguna'}
+TAREAS PENDIENTES HOY:
+${tareas.filter(t => t['Completada'] !== 'Sí').slice(0, 12).map(t =>
+  `- [${t['Prioridad'] || 'Normal'}] ${t['Tarea'] || '?'} | ${t['Categoria'] || ''}`
+).join('\n') || 'Ninguna'}
 
-COBROS PENDIENTES:
-${meDeben.filter(d => d['Estado'] === 'Pendiente').map(c =>
-    `- ${c['Quien'] || '?'}: ${c['Monto (BOB)']} BOB — ${c['Concepto'] || ''}`
-  ).join('\n') || 'Ninguno'}
+COBROS QUE ME DEBEN (total: ${saldosTotalesMeDeben} BOB):
+${cobrosDirectos.join('\n') || 'Ninguno registrado'}
 
-LEADS:
+LO QUE DEBO (total: ${saldosTotalesDebo} BOB):
+${debo.filter(d => d['Estado'] === 'Pendiente').map(d =>
+  `- A ${d['Quien'] || '?'}: ${d['Monto (BOB)']} BOB — ${d['Concepto'] || ''}`
+).join('\n') || 'Nada'}
+
+FINANZAS MES ACTUAL:
+- Ingresos: ${ingresosMes} BOB
+- Gastos: ${gastosMes} BOB
+- Balance: ${ingresosMes - gastosMes} BOB
+
+LEADS NUEVOS:
 ${leads.filter(l => l['Estado'] === 'Nuevo').map(l =>
-    `- ${l['Nombre']}: ${l['Tipo de consulta']} via ${l['Fuente']}`
-  ).join('\n') || 'Ninguno nuevo'}
+  `- ${l['Nombre']}: ${l['Tipo de consulta']} via ${l['Fuente']}`
+).join('\n') || 'Ninguno nuevo'}
 
 CONTENIDO EN PROCESO:
 ${contenido.filter(c => c['Estado'] && c['Estado'] !== 'Publicado').slice(0, 5).map(c =>
-    `- ${c['Nombre / Hook'] || '?'} | ${c['Estado']} | ${c['Fecha publicacion'] || 'sin fecha'}`
-  ).join('\n') || 'Ninguno'}
+  `- ${c['Nombre / Hook'] || '?'} | ${c['Estado']} | ${c['Fecha publicacion'] || 'sin fecha'}`
+).join('\n') || 'Ninguno'}
 
 METAS ACTIVAS:
-${metas.filter(m => m['Estado'] === 'En proceso').slice(0, 4).map(m =>
-    `- ${m['Meta']}: ${m['Progreso (%)'] || 0}%`
-  ).join('\n') || 'Ninguna'}`.trim();
+${metas.filter(m => m['Estado'] === 'En proceso').slice(0, 5).map(m =>
+  `- ${m['Meta']}: ${m['Progreso (%)'] || 0}% | Fecha: ${m['Fecha limite'] || '?'}`
+).join('\n') || 'Ninguna'}`.trim();
 }
 
 // ── Historial persistente desde Sheets ───────────────────────────────────────
 async function cargarHistorialDesdeSheets(sheets, from) {
   try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEETS_ID, range: 'HISTORIAL!A1:D500',
-    });
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEETS_ID, range: 'HISTORIAL!A1:D500' });
     const filas = res.data.values || [];
     if (filas.length < 2) return [];
     return filas.slice(1)
@@ -220,7 +254,7 @@ async function cargarHistorialDesdeSheets(sheets, from) {
 async function obtenerHistorial(sheets, from) {
   if (!historialCache[from]) {
     historialCache[from] = await cargarHistorialDesdeSheets(sheets, from);
-    console.log(`📚 Historial cargado: ${historialCache[from].length} mensajes`);
+    console.log(`📚 Historial: ${historialCache[from].length} msgs`);
   }
   return historialCache[from];
 }
@@ -235,9 +269,7 @@ function agregarAlHistorial(from, role, content) {
 
 async function guardarHistorial(sheets, from, role, content) {
   try {
-    await agregarFila(sheets, 'HISTORIAL', [
-      new Date().toISOString(), from, role, String(content).slice(0, 800)
-    ]);
+    await agregarFila(sheets, 'HISTORIAL', [new Date().toISOString(), from, role, String(content).slice(0, 800)]);
   } catch (e) { console.log('⚠️ Historial no guardado:', e.message); }
 }
 
@@ -247,32 +279,50 @@ const TOOLS = [
     name: 'agregar_tarea',
     description: 'Agrega una tarea a TAREAS DIA',
     input_schema: { type: 'object', properties: {
-      tarea: { type: 'string' }, prioridad: { type: 'string', enum: ['Urgente', 'Alta', 'Media', 'Baja'] },
+      tarea: { type: 'string' },
+      prioridad: { type: 'string', enum: ['Urgente', 'Alta', 'Media', 'Baja'] },
       categoria: { type: 'string' },
+      notas: { type: 'string' },
     }, required: ['tarea'] },
   },
   {
     name: 'registrar_finanza',
     description: 'Registra ingreso o gasto en FINANZAS',
     input_schema: { type: 'object', properties: {
-      descripcion: { type: 'string' }, tipo: { type: 'string', enum: ['Ingreso', 'Gasto'] },
-      monto: { type: 'number' }, categoria: { type: 'string' },
+      descripcion: { type: 'string' },
+      tipo: { type: 'string', enum: ['Ingreso', 'Gasto'] },
+      monto: { type: 'number' },
+      categoria: { type: 'string' },
     }, required: ['descripcion', 'tipo', 'monto'] },
   },
   {
     name: 'agregar_lead',
     description: 'Registra un nuevo lead o consulta en LEADS',
     input_schema: { type: 'object', properties: {
-      nombre: { type: 'string' }, tipo_consulta: { type: 'string' },
-      fuente: { type: 'string' }, notas: { type: 'string' },
+      nombre: { type: 'string' },
+      tipo_consulta: { type: 'string' },
+      fuente: { type: 'string' },
+      notas: { type: 'string' },
     }, required: ['nombre', 'tipo_consulta'] },
   },
   {
     name: 'registrar_cobro',
-    description: 'Registra cobro pendiente en ME DEBEN',
+    description: 'Registra cobro pendiente en ME DEBEN (alguien le debe a Nath)',
     input_schema: { type: 'object', properties: {
-      quien: { type: 'string' }, monto: { type: 'number' },
-      concepto: { type: 'string' }, fecha_limite: { type: 'string' },
+      quien: { type: 'string' },
+      monto: { type: 'number' },
+      concepto: { type: 'string' },
+      fecha_limite: { type: 'string' },
+    }, required: ['quien', 'monto', 'concepto'] },
+  },
+  {
+    name: 'registrar_deuda',
+    description: 'Registra una deuda de Nath en DEBO (lo que Nath debe a otros)',
+    input_schema: { type: 'object', properties: {
+      quien: { type: 'string' },
+      monto: { type: 'number' },
+      concepto: { type: 'string' },
+      fecha_limite: { type: 'string' },
     }, required: ['quien', 'monto', 'concepto'] },
   },
   {
@@ -283,11 +333,33 @@ const TOOLS = [
     }, required: ['tarea'] },
   },
   {
-    name: 'agregar_nota_boda',
-    description: 'Agrega nota o actualización a una boda',
+    name: 'actualizar_boda',
+    description: 'Actualiza estado, saldo o notas de una boda existente en BODAS',
     input_schema: { type: 'object', properties: {
-      pareja: { type: 'string' }, nota: { type: 'string' },
-    }, required: ['pareja', 'nota'] },
+      pareja: { type: 'string', description: 'Nombre de la pareja' },
+      estado: { type: 'string', description: 'Nuevo estado (ej: CONFIRMADA, En entrega, Completada)' },
+      saldo_pendiente: { type: 'number', description: 'Nuevo saldo pendiente en BOB' },
+      nota: { type: 'string', description: 'Nota para agregar' },
+    }, required: ['pareja'] },
+  },
+  {
+    name: 'registrar_pago_boda',
+    description: 'Cuando un cliente paga su boda: actualiza saldo en BODAS, marca cobro pagado en ME DEBEN y registra ingreso en FINANZAS',
+    input_schema: { type: 'object', properties: {
+      pareja: { type: 'string' },
+      monto_pagado: { type: 'number' },
+    }, required: ['pareja', 'monto_pagado'] },
+  },
+  {
+    name: 'agregar_meta',
+    description: 'Agrega o actualiza una meta en METAS',
+    input_schema: { type: 'object', properties: {
+      meta: { type: 'string' },
+      categoria: { type: 'string' },
+      fecha_limite: { type: 'string' },
+      progreso: { type: 'number' },
+      notas: { type: 'string' },
+    }, required: ['meta'] },
   },
 ];
 
@@ -296,32 +368,114 @@ async function ejecutarHerramienta(sheets, name, input) {
   console.log(`🔧 ${name}:`, JSON.stringify(input));
   try {
     switch (name) {
+
       case 'agregar_tarea':
-        await agregarFila(sheets, 'TAREAS DIA', [input.tarea, input.prioridad || 'Media', input.categoria || '', hoy, 'No', '', '']);
+        // Columnas TAREAS DIA: Fecha, Auto generada, Notas, Categoria, Completada, Prioridad, Tarea
+        await agregarFila(sheets, 'TAREAS DIA', [hoy, 'No', input.notas || '', input.categoria || '', 'No', input.prioridad || 'Media', input.tarea]);
         return `✅ Tarea agregada: "${input.tarea}"`;
+
       case 'registrar_finanza':
+        // Columnas FINANZAS: Descripcion, Tipo, Categoria, Fecha, Monto (BOB)
         await agregarFila(sheets, 'FINANZAS', [input.descripcion, input.tipo, input.categoria || 'General', hoy, input.monto]);
         return `✅ ${input.tipo} de ${input.monto} BOB registrado`;
+
       case 'agregar_lead':
-        await agregarFila(sheets, 'LEADS', [input.nombre, input.tipo_consulta, input.fuente || 'WhatsApp', hoy, 'Nuevo', input.notas || '', '', '']);
+        // Columnas LEADS: Nombre, Tipo de consulta, Fuente, Fecha, Estado, Notas
+        await agregarFila(sheets, 'LEADS', [input.nombre, input.tipo_consulta, input.fuente || 'WhatsApp', hoy, 'Nuevo', input.notas || '']);
         return `✅ Lead: ${input.nombre}`;
+
       case 'registrar_cobro':
+        // Columnas ME DEBEN: Quien, Monto (BOB), Concepto, Fecha limite, Estado
         await agregarFila(sheets, 'ME DEBEN', [input.quien, input.monto, input.concepto, input.fecha_limite || '', 'Pendiente']);
         return `✅ Cobro registrado: ${input.quien} → ${input.monto} BOB`;
+
+      case 'registrar_deuda':
+        // Columnas DEBO: Quien, Monto (BOB), Concepto, Fecha limite, Estado
+        await agregarFila(sheets, 'DEBO', [input.quien, input.monto, input.concepto, input.fecha_limite || '', 'Pendiente']);
+        return `✅ Deuda registrada: le debo a ${input.quien} → ${input.monto} BOB`;
+
       case 'marcar_tarea_completada': {
-        const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEETS_ID, range: 'TAREAS DIA!A1:G100' });
-        const filas = res.data.values || [];
+        // Columnas TAREAS DIA: Fecha(A), Auto generada(B), Notas(C), Categoria(D), Completada(E), Prioridad(F), Tarea(G)
+        const filas = await leerFilasBrutas(sheets, 'TAREAS DIA', 'A1:G150');
         for (let i = 1; i < filas.length; i++) {
-          if (filas[i][0]?.toLowerCase().includes(input.tarea.toLowerCase()) && filas[i][4] !== 'Sí') {
+          const nombreTarea = filas[i][6] || ''; // columna G = Tarea
+          const completada = filas[i][4] || '';  // columna E = Completada
+          if (nombreTarea.toLowerCase().includes(input.tarea.toLowerCase()) && completada !== 'Sí') {
             await actualizarCelda(sheets, 'TAREAS DIA', `E${i + 1}`, 'Sí');
-            return `✅ Completada: "${filas[i][0]}"`;
+            return `✅ Completada: "${nombreTarea}"`;
           }
         }
-        return `⚠️ No encontré: "${input.tarea}"`;
+        return `⚠️ No encontré la tarea: "${input.tarea}"`;
       }
-      case 'agregar_nota_boda':
-        await agregarFila(sheets, 'BODAS', [`[NOTA ${hoy}] ${input.pareja}: ${input.nota}`, '', '', '', '', '', '', '']);
-        return `✅ Nota agregada a ${input.pareja}`;
+
+      case 'actualizar_boda': {
+        // Columnas BODAS: Total contrato(A), Notas(B), Telefono(C), Entregas pendientes(D),
+        //                  Contrato firmado(E), Reserva pagada(F), Estado(G), Pre boda/Civil(H),
+        //                  Fecha de boda(I), Paquete(J), Saldo pendiente(K), Pareja(L)
+        const filas = await leerFilasBrutas(sheets, 'BODAS', 'A1:L100');
+        for (let i = 1; i < filas.length; i++) {
+          const pareja = filas[i][11] || ''; // columna L = Pareja
+          if (pareja.toLowerCase().includes(input.pareja.toLowerCase())) {
+            const cambios = [];
+            if (input.estado) {
+              await actualizarCelda(sheets, 'BODAS', `G${i + 1}`, input.estado);
+              cambios.push(`Estado → ${input.estado}`);
+            }
+            if (input.saldo_pendiente !== undefined) {
+              await actualizarCelda(sheets, 'BODAS', `K${i + 1}`, input.saldo_pendiente);
+              cambios.push(`Saldo → ${input.saldo_pendiente} BOB`);
+            }
+            if (input.nota) {
+              const notaActual = filas[i][1] || '';
+              const nuevaNota = notaActual ? `${notaActual} | [${hoy}] ${input.nota}` : `[${hoy}] ${input.nota}`;
+              await actualizarCelda(sheets, 'BODAS', `B${i + 1}`, nuevaNota);
+              cambios.push('Nota agregada');
+            }
+            return cambios.length > 0
+              ? `✅ ${pareja} actualizada: ${cambios.join(', ')}`
+              : `⚠️ No se especificó qué actualizar en ${pareja}`;
+          }
+        }
+        return `⚠️ No encontré la pareja: "${input.pareja}"`;
+      }
+
+      case 'registrar_pago_boda': {
+        const filas = await leerFilasBrutas(sheets, 'BODAS', 'A1:L100');
+        let nombrePareja = input.pareja;
+        for (let i = 1; i < filas.length; i++) {
+          const pareja = filas[i][11] || '';
+          if (pareja.toLowerCase().includes(input.pareja.toLowerCase())) {
+            nombrePareja = pareja;
+            const saldoActual = parseFloat(filas[i][10] || 0);
+            const nuevoSaldo = Math.max(0, saldoActual - input.monto_pagado);
+            await actualizarCelda(sheets, 'BODAS', `K${i + 1}`, nuevoSaldo);
+            if (nuevoSaldo === 0) {
+              await actualizarCelda(sheets, 'BODAS', `G${i + 1}`, 'Completada');
+            }
+            break;
+          }
+        }
+        // Marcar cobro como pagado en ME DEBEN
+        const filasMD = await leerFilasBrutas(sheets, 'ME DEBEN', 'A1:E100');
+        for (let i = 1; i < filasMD.length; i++) {
+          if ((filasMD[i][0] || '').toLowerCase().includes(input.pareja.toLowerCase()) && filasMD[i][4] === 'Pendiente') {
+            await actualizarCelda(sheets, 'ME DEBEN', `E${i + 1}`, 'Pagado');
+            break;
+          }
+        }
+        // Registrar ingreso en FINANZAS
+        await agregarFila(sheets, 'FINANZAS', [`Pago boda: ${nombrePareja}`, 'Ingreso', 'Bodas', hoy, input.monto_pagado]);
+        return `✅ Pago registrado: ${nombrePareja} pagó ${input.monto_pagado} BOB. Ingreso en FINANZAS, cobro marcado como pagado.`;
+      }
+
+      case 'agregar_meta':
+        // Columnas METAS: Meta, Estado, Progreso (%), Fecha limite, Categoria, Notas
+        await agregarFila(sheets, 'METAS', [
+          input.meta, 'En proceso', input.progreso || 0,
+          input.fecha_limite || '', input.categoria || '', input.notas || '',
+        ]);
+        return `✅ Meta agregada: "${input.meta}"`;
+
       default:
         return `⚠️ Herramienta desconocida: ${name}`;
     }
@@ -334,25 +488,35 @@ async function ejecutarHerramienta(sheets, name, input) {
 async function generarTareasDelDia(sheets) {
   try {
     const hoy = new Date().toISOString().split('T')[0];
-    const tareas = await leerHoja(sheets, 'TAREAS DIA', 'A1:G100');
-    if (tareas.some(t => t['Fecha'] === hoy && t['Auto generada'] === 'Sí')) return;
+    const tareasRaw = await leerFilasBrutas(sheets, 'TAREAS DIA', 'A1:G100');
+    // Si ya hay tareas auto-generadas hoy, no duplicar
+    // Columnas: Fecha(A=0), Auto generada(B=1), ..., Tarea(G=6)
+    const yaGeneradas = tareasRaw.slice(1).some(f => f[0] === hoy && f[1] === 'Sí');
+    if (yaGeneradas) return;
 
     const [bodas, meDeben, contenido] = await Promise.all([
-      leerHoja(sheets, 'BODAS'), leerHoja(sheets, 'ME DEBEN', 'A1:E50'), leerHoja(sheets, 'CONTENIDO', 'A1:H50'),
+      leerHoja(sheets, 'BODAS'),
+      leerHoja(sheets, 'ME DEBEN', 'A1:E100'),
+      leerHoja(sheets, 'CONTENIDO', 'A1:H50'),
     ]);
 
     const nuevas = [];
-    bodas.filter(b => b['Estado']?.match(/entrega/i)).forEach(b => {
-      nuevas.push([`Entregar: ${b['Pareja'] || b['Nombre'] || '?'}`, b['Estado']?.match(/bloqueada/i) ? 'Urgente' : 'Alta', 'Edicion', hoy, 'No', '', 'Sí']);
-    });
+
     bodas.filter(b => b['Estado']?.match(/bloqueada/i)).forEach(b => {
-      nuevas.push([`URGENTE cobrar ${b['Saldo pendiente'] || b['Saldo pendiente (BOB)'] || ''} BOB — ${b['Pareja'] || '?'}`, 'Urgente', 'Administracion', hoy, 'No', '', 'Sí']);
+      nuevas.push([hoy, 'Sí', '', 'Administracion', 'No', 'Urgente',
+        `URGENTE cobrar ${b['Saldo pendiente'] || ''} BOB — ${b['Pareja'] || '?'}`]);
+    });
+    bodas.filter(b => b['Estado']?.match(/entrega/i) && !b['Estado']?.match(/bloqueada/i)).forEach(b => {
+      nuevas.push([hoy, 'Sí', `Pareja: ${b['Pareja']}`, 'Edicion', 'No', 'Alta',
+        `Entregar: ${b['Pareja'] || '?'} — ${b['Entregas pendientes'] || 'ver sheet'}`]);
     });
     meDeben.filter(d => d['Estado'] === 'Pendiente').slice(0, 3).forEach(d => {
-      nuevas.push([`Cobrar a ${d['Quien'] || '?'}: ${d['Monto (BOB)']} BOB`, 'Alta', 'Administracion', hoy, 'No', d['Concepto'] || '', 'Sí']);
+      nuevas.push([hoy, 'Sí', d['Concepto'] || '', 'Administracion', 'No', 'Alta',
+        `Cobrar a ${d['Quien'] || '?'}: ${d['Monto (BOB)']} BOB`]);
     });
     contenido.filter(c => c['Fecha publicacion'] === hoy && c['Estado'] !== 'Publicado').forEach(c => {
-      nuevas.push([`Publicar hoy: ${c['Nombre / Hook'] || '?'}`, 'Alta', 'Marketing', hoy, 'No', '', 'Sí']);
+      nuevas.push([hoy, 'Sí', '', 'Marketing', 'No', 'Alta',
+        `Publicar hoy: ${c['Nombre / Hook'] || '?'}`]);
     });
 
     for (const t of nuevas) await agregarFila(sheets, 'TAREAS DIA', t);
@@ -360,15 +524,64 @@ async function generarTareasDelDia(sheets) {
   } catch (e) { console.log('⚠️ Error generando tareas:', e.message); }
 }
 
+// ── Actualizar pestaña RESUMEN con datos reales ───────────────────────────────
+async function actualizarResumen(sheets) {
+  try {
+    const [bodas, finanzas, meDeben, debo, tareas, metas] = await Promise.all([
+      leerHoja(sheets, 'BODAS'),
+      leerHoja(sheets, 'FINANZAS', 'A1:E100'),
+      leerHoja(sheets, 'ME DEBEN', 'A1:E100'),
+      leerHoja(sheets, 'DEBO', 'A1:E100'),
+      leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
+      leerHoja(sheets, 'METAS', 'A1:F50'),
+    ]);
+    const mesActual = new Date().toISOString().slice(0, 7);
+    const ingresos = finanzas.filter(f => f['Tipo'] === 'Ingreso' && (f['Fecha'] || '').startsWith(mesActual))
+      .reduce((s, f) => s + parseFloat(f['Monto (BOB)'] || 0), 0);
+    const gastos = finanzas.filter(f => f['Tipo'] === 'Gasto' && (f['Fecha'] || '').startsWith(mesActual))
+      .reduce((s, f) => s + parseFloat(f['Monto (BOB)'] || 0), 0);
+    const totalMeDeben = meDeben.filter(d => d['Estado'] === 'Pendiente')
+      .reduce((s, d) => s + parseFloat(d['Monto (BOB)'] || 0), 0);
+    const totalDebo = debo.filter(d => d['Estado'] === 'Pendiente')
+      .reduce((s, d) => s + parseFloat(d['Monto (BOB)'] || 0), 0);
+    const bodasActivas = bodas.filter(b => b['Estado'] && !b['Estado'].match(/completad/i)).length;
+    const tareasPendientes = tareas.filter(t => t['Completada'] !== 'Sí').length;
+
+    const valores = [
+      ['NATHBOT — RESUMEN NR FILMS', new Date().toLocaleString('es-BO')],
+      [],
+      ['=== FINANZAS MES ACTUAL ==='],
+      ['Ingresos (BOB)', ingresos],
+      ['Gastos (BOB)', gastos],
+      ['Balance (BOB)', ingresos - gastos],
+      [],
+      ['=== COBROS ==='],
+      ['Me deben pendiente (BOB)', totalMeDeben],
+      ['Debo pendiente (BOB)', totalDebo],
+      [],
+      ['=== NEGOCIO ==='],
+      ['Bodas activas', bodasActivas],
+      ['Tareas pendientes', tareasPendientes],
+      ['Metas en proceso', metas.filter(m => m['Estado'] === 'En proceso').length],
+    ];
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEETS_ID, range: 'RESUMEN!A1',
+      valueInputOption: 'USER_ENTERED', requestBody: { values: valores },
+    });
+  } catch (e) { console.log('⚠️ No se pudo actualizar RESUMEN:', e.message); }
+}
+
 // ── Resumen diario ────────────────────────────────────────────────────────────
 async function enviarResumenDia() {
   const sheets = await getSheetsClient();
-  const contexto = await construirContexto(sheets);
   await generarTareasDelDia(sheets);
+  await actualizarResumen(sheets);
+  const contexto = await construirContexto(sheets);
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6', max_tokens: 800,
-    system: 'Sos Nathbot, asistente de Nath Rivas (NR FILMS, Santa Cruz, Bolivia). Generás resúmenes diarios para WhatsApp. Formato compacto con emojis, máximo 10 líneas, solo lo urgente.',
+    system: 'Sos Nathbot, asistente de Nath Rivas (NR FILMS, Santa Cruz, Bolivia). Generás resúmenes diarios para WhatsApp. Formato compacto con emojis, máximo 10 líneas, solo lo urgente e importante.',
     messages: [{ role: 'user', content: `Resumen del día para Nath. Solo lo urgente e importante. Una acción prioritaria al final.\n\n${contexto}` }],
   });
 
@@ -396,7 +609,6 @@ app.post('/whatsapp', async (req, res) => {
       obtenerHistorial(sheets, from),
     ]);
 
-    // ── Construir contenido del mensaje ──────────────────────────────────────
     let contenidoUsuario = [];
     let tieneAudio = false;
     let audioTranscrito = null;
@@ -406,25 +618,22 @@ app.post('/whatsapp', async (req, res) => {
       const mediaType = req.body[`MediaContentType${i}`] || '';
 
       if (mediaType.startsWith('image/')) {
-        // Imagen → pasarla a Claude directamente
         try {
           const base64 = await descargarImagenBase64(mediaUrl);
           const mt = mediaType.includes('png') ? 'image/png' : mediaType.includes('gif') ? 'image/gif' : mediaType.includes('webp') ? 'image/webp' : 'image/jpeg';
           contenidoUsuario.push({ type: 'image', source: { type: 'base64', media_type: mt, data: base64 } });
-          console.log(`🖼️ Imagen procesada (${mt})`);
+          console.log(`🖼️ Imagen (${mt})`);
         } catch (e) {
-          console.log('⚠️ Error imagen:', e.message);
           contenidoUsuario.push({ type: 'text', text: '[Nath mandó una imagen pero no pude cargarla]' });
         }
       } else if (mediaType.startsWith('audio/') || mediaType.includes('ogg') || mediaType.includes('mp4')) {
-        // Audio → transcribir con Whisper si hay key, si no aviso amigable
         tieneAudio = true;
         audioTranscrito = await transcribirAudio(mediaUrl);
         if (audioTranscrito) {
-          console.log(`🎙️ Audio transcrito: "${audioTranscrito.slice(0, 80)}"`);
-          contenidoUsuario.push({ type: 'text', text: `[Audio de Nath transcrito]: ${audioTranscrito}` });
+          console.log(`🎙️ Audio: "${audioTranscrito.slice(0, 60)}"`);
+          contenidoUsuario.push({ type: 'text', text: `[Audio de Nath]: ${audioTranscrito}` });
         } else {
-          contenidoUsuario.push({ type: 'text', text: '[Nath mandó un audio — aún no tengo transcripción de voz. Escribime lo que necesitás y te respondo!]' });
+          contenidoUsuario.push({ type: 'text', text: '[Nath mandó un audio — escribime lo que necesitás y te respondo!]' });
         }
       } else {
         contenidoUsuario.push({ type: 'text', text: `[Nath mandó un archivo: ${mediaType}]` });
@@ -434,20 +643,29 @@ app.post('/whatsapp', async (req, res) => {
     if (texto) contenidoUsuario.push({ type: 'text', text: texto });
     if (contenidoUsuario.length === 0) contenidoUsuario.push({ type: 'text', text: '(sin contenido)' });
 
-    // ── Mensajes con historial ────────────────────────────────────────────────
     const mensajes = [
       ...historial.map(m => ({ role: m.role, content: m.content })),
       { role: 'user', content: contenidoUsuario },
     ];
 
-    // ── Llamar a Claude ───────────────────────────────────────────────────────
     const SYSTEM = `Sos Nathbot, el asistente personal e inteligente de Nath Rivas. Ella dirige NR FILMS, productora de video y fotografía en Santa Cruz, Bolivia.
 
 Tenés acceso completo a su base de datos (Google Sheets). Cuando Nath mencione algo que deba registrarse, usá las herramientas automáticamente SIN pedirle permiso. Actuá, no preguntes.
 
-Si recibís una imagen de captura de conversación → identificá si hay lead nuevo y registralo.
-Si recibís imagen de presupuesto o contrato → leélo y resumilo.
-Si recibís audio transcrito → respondé al contenido del audio naturalmente.
+Herramientas disponibles:
+- agregar_tarea: registrar tarea nueva
+- registrar_finanza: ingreso o gasto
+- agregar_lead: lead o consulta nueva
+- registrar_cobro: alguien le debe a Nath (ME DEBEN)
+- registrar_deuda: Nath le debe a alguien (DEBO)
+- marcar_tarea_completada: cuando Nath dice que hizo algo
+- actualizar_boda: cambiar estado, saldo o agregar nota a una boda
+- registrar_pago_boda: cuando un cliente paga su boda (actualiza BODAS + ME DEBEN + FINANZAS en un solo paso)
+- agregar_meta: registrar o actualizar una meta
+
+Si recibís imagen de conversación → identificá si hay lead y registralo.
+Si recibís imagen de presupuesto/contrato → leélo y resumilo.
+Cuando Nath dice "me pagó X de Y pareja" → usá registrar_pago_boda.
 
 ESTADO ACTUAL DEL NEGOCIO:
 ${contexto}
@@ -455,41 +673,32 @@ ${contexto}
 REGLAS:
 - Español, tono directo y cálido, como socio de confianza
 - Respuestas cortas (máximo 3 párrafos)
-- Recordás TODO lo que Nath dijo antes en esta conversación
-- Usás emojis con moderación
-- Actualizás Sheets proactivamente`;
+- Recordás todo lo de la conversación
+- Emojis con moderación
+- Actualizás Sheets proactivamente sin preguntar`;
 
-    let respuestaFinal = '';
     let response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6', max_tokens: 1024,
       system: SYSTEM, tools: TOOLS, messages: mensajes,
     });
 
-    // ── Agentic loop ──────────────────────────────────────────────────────────
     while (response.stop_reason === 'tool_use') {
       const toolUses = response.content.filter(b => b.type === 'tool_use');
       const toolResults = [];
-      const acciones = [];
-
       for (const t of toolUses) {
         const resultado = await ejecutarHerramienta(sheets, t.name, t.input);
         toolResults.push({ type: 'tool_result', tool_use_id: t.id, content: resultado });
-        acciones.push(resultado);
       }
-
       mensajes.push({ role: 'assistant', content: response.content });
       mensajes.push({ role: 'user', content: toolResults });
-
       response = await anthropic.messages.create({
         model: 'claude-sonnet-4-6', max_tokens: 1024,
         system: SYSTEM, tools: TOOLS, messages: mensajes,
       });
     }
 
-    const textoFinal = response.content.find(b => b.type === 'text')?.text || 'Listo Nath 👍';
-    respuestaFinal = textoFinal;
+    const respuestaFinal = response.content.find(b => b.type === 'text')?.text || 'Listo Nath 👍';
 
-    // ── Guardar en historial ──────────────────────────────────────────────────
     const textoUsuario = audioTranscrito || texto || '[imagen]';
     agregarAlHistorial(from, 'user', textoUsuario);
     agregarAlHistorial(from, 'assistant', respuestaFinal);
@@ -509,7 +718,7 @@ REGLAS:
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── Resumen diario (cron externo) ─────────────────────────────────────────────
+// ── Endpoints de administración ───────────────────────────────────────────────
 app.get('/resumen-dia', async (req, res) => {
   if (req.query.secret !== (getEnv('CRON_SECRET') || 'nathbot2026')) return res.status(401).send('No autorizado');
   try {
@@ -521,8 +730,19 @@ app.get('/resumen-dia', async (req, res) => {
   }
 });
 
+app.get('/actualizar-resumen', async (req, res) => {
+  if (req.query.secret !== (getEnv('CRON_SECRET') || 'nathbot2026')) return res.status(401).send('No autorizado');
+  try {
+    const sheets = await getSheetsClient();
+    await actualizarResumen(sheets);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get('/ping', (req, res) => res.send('pong'));
-app.get('/', (req, res) => res.send('🤖 Nathbot v3 activo'));
+app.get('/', (req, res) => res.send('🤖 Nathbot v4 activo — Sistema sólido'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🤖 Nathbot v3 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🤖 Nathbot v4 en puerto ${PORT}`));
