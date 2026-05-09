@@ -155,7 +155,7 @@ async function transcribirAudio(mediaUrl) {
 
 // ── Contexto del negocio desde Sheets ────────────────────────────────────────
 async function construirContexto(sheets) {
-  const [bodas, tareas, finanzas, meDeben, debo, metas, contenido, leads, proyectos, marketing, proyectosNuevos] = await Promise.all([
+  const [bodas, tareas, finanzas, meDeben, debo, metas, contenido, leads, proyectos, marketing, proyectosNuevos, reels, workshop] = await Promise.all([
     leerHoja(sheets, 'BODAS'),
     leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
     leerHoja(sheets, 'FINANZAS', 'A1:E100'),
@@ -167,6 +167,8 @@ async function construirContexto(sheets) {
     leerHoja(sheets, 'PROYECTOS', 'A1:J50'),
     leerHoja(sheets, 'MARKETING', 'A1:L50'),
     leerHoja(sheets, 'PROYECTOS NUEVOS', 'A1:H30'),
+    leerHoja(sheets, 'SEGUIMIENTO REELS', 'A1:H20'),
+    leerHoja(sheets, 'DE CERO A MARCA', 'A1:B50'),
   ]);
 
   const hoy = new Date().toLocaleDateString('es-BO');
@@ -242,7 +244,17 @@ ${contenido.filter(c => c['Estado'] && c['Estado'] !== 'Publicado').slice(0, 5).
 METAS ACTIVAS:
 ${metas.filter(m => m['Estado'] === 'En proceso').slice(0, 5).map(m =>
   `- ${m['Meta']}: ${m['Progreso (%)'] || 0}% | Fecha: ${m['Fecha limite'] || '?'}`
-).join('\n') || 'Ninguna'}`.trim();
+).join('\n') || 'Ninguna'}
+
+SEGUIMIENTO REELS (producción de contenido):
+${reels.slice(0, 12).map(r =>
+  `- Reel ${r['Reel'] || '?'}: ${r['Tema'] || '?'} | Grabé: ${r['Grabé'] || '⬜'} | Publicado: ${r['Publicado'] || '⬜'}`
+).join('\n') || 'Sin datos'}
+
+DE CERO A MARCA — WORKSHOP:
+${workshop.filter(w => w['SECCIÓN'] && w['DETALLE']).slice(0, 10).map(w =>
+  `- ${w['SECCIÓN']}: ${w['DETALLE']}`
+).join('\n') || 'Sin datos'}`.trim();
 }
 
 // ── Historial persistente desde Sheets ───────────────────────────────────────
@@ -587,15 +599,19 @@ async function generarTareasDelDia(sheets) {
 // ── Actualizar pestaña RESUMEN con datos reales ───────────────────────────────
 async function actualizarResumen(sheets) {
   try {
-    const [bodas, finanzas, meDeben, debo, tareas, metas] = await Promise.all([
+    const [bodas, finanzas, meDeben, debo, tareas, metas, leads, reels] = await Promise.all([
       leerHoja(sheets, 'BODAS'),
-      leerHoja(sheets, 'FINANZAS', 'A1:E100'),
+      leerHoja(sheets, 'FINANZAS', 'A1:E200'),
       leerHoja(sheets, 'ME DEBEN', 'A1:E100'),
       leerHoja(sheets, 'DEBO', 'A1:E100'),
-      leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
+      leerHoja(sheets, 'TAREAS DIA', 'A1:G200'),
       leerHoja(sheets, 'METAS', 'A1:F50'),
+      leerHoja(sheets, 'LEADS', 'A1:F100'),
+      leerHoja(sheets, 'SEGUIMIENTO REELS'),
     ]);
     const mesActual = new Date().toISOString().slice(0, 7);
+    const hoy = new Date().toISOString().split('T')[0];
+
     const ingresos = finanzas.filter(f => f['Tipo'] === 'Ingreso' && (f['Fecha'] || '').startsWith(mesActual))
       .reduce((s, f) => s + parseFloat(f['Monto (BOB)'] || 0), 0);
     const gastos = finanzas.filter(f => f['Tipo'] === 'Gasto' && (f['Fecha'] || '').startsWith(mesActual))
@@ -604,24 +620,67 @@ async function actualizarResumen(sheets) {
       .reduce((s, d) => s + parseFloat(d['Monto (BOB)'] || 0), 0);
     const totalDebo = debo.filter(d => d['Estado'] === 'Pendiente')
       .reduce((s, d) => s + parseFloat(d['Monto (BOB)'] || 0), 0);
-    const bodasActivas = bodas.filter(b => b['Estado'] && !b['Estado'].match(/completad/i)).length;
+    const bodasActivas = bodas.filter(b => b['Estado'] && !b['Estado'].match(/completad|cancelad/i)).length;
+    const bodasEntrega = bodas.filter(b => b['Estado'] && b['Estado'].match(/entrega/i)).length;
+    const bodasBloqueadas = bodas.filter(b => b['Estado'] && b['Estado'].match(/bloqueada/i)).length;
     const tareasPendientes = tareas.filter(t => t['Completada'] !== 'Sí').length;
+    const tareasHoy = tareas.filter(t => t['Completada'] !== 'Sí' && (t['Fecha'] || '') === hoy).length;
+
+    // Total facturado / cobrado / pendiente desde contratos de bodas
+    const totalFacturado = bodas
+      .filter(b => b['Estado'] && !b['Estado'].match(/cancelad/i))
+      .reduce((s, b) => s + parseFloat(b['Total contrato'] || 0), 0);
+    const totalSaldoPend = bodas
+      .filter(b => b['Estado'] && !b['Estado'].match(/cancelad/i))
+      .reduce((s, b) => s + parseFloat(b['Saldo pendiente'] || 0), 0);
+    const totalCobrado = totalFacturado - totalSaldoPend;
+
+    // Leads últimos 7 días
+    const haceSiete = new Date(); haceSiete.setDate(haceSiete.getDate() - 7);
+    const leadsUlt7 = leads.filter(l => new Date(l['Fecha'] || '') >= haceSiete).length;
+
+    // Reels
+    const reelsFilas = reels.length > 1 ? reels.slice(1) : [];
+    const reelsGrabados = reelsFilas.filter(r => r[2] === '✅').length;
+    const reelsPublicados = reelsFilas.filter(r => r[5] === '✅').length;
 
     const valores = [
-      ['NATHBOT — RESUMEN NR FILMS', new Date().toLocaleString('es-BO')],
+      ['🤖 NATHBOT — RESUMEN NR FILMS', new Date().toLocaleString('es-BO')],
       [],
-      ['=== FINANZAS MES ACTUAL ==='],
-      ['Ingresos (BOB)', ingresos],
-      ['Gastos (BOB)', gastos],
+      ['=== 💰 CONTRATOS BODAS ==='],
+      ['Total facturado (BOB)', totalFacturado],
+      ['Total cobrado (BOB)', totalCobrado],
+      ['Saldo pendiente cobro (BOB)', totalSaldoPend],
+      [],
+      ['=== 📊 FINANZAS MES ' + mesActual + ' ==='],
+      ['Ingresos registrados (BOB)', ingresos],
+      ['Gastos registrados (BOB)', gastos],
       ['Balance (BOB)', ingresos - gastos],
       [],
-      ['=== COBROS ==='],
+      ['=== 💸 COBROS Y DEUDAS ==='],
       ['Me deben pendiente (BOB)', totalMeDeben],
-      ['Debo pendiente (BOB)', totalDebo],
+      ['Yo debo pendiente (BOB)', totalDebo],
+      ['Balance cobros/deudas (BOB)', totalMeDeben - totalDebo],
       [],
-      ['=== NEGOCIO ==='],
+      ['=== 📸 BODAS ==='],
       ['Bodas activas', bodasActivas],
-      ['Tareas pendientes', tareasPendientes],
+      ['En proceso de entrega', bodasEntrega],
+      ['Entrega bloqueada (cobro pendiente)', bodasBloqueadas],
+      [],
+      ['=== ✅ TAREAS ==='],
+      ['Tareas pendientes totales', tareasPendientes],
+      ['Tareas con fecha hoy', tareasHoy],
+      [],
+      ['=== 🎯 LEADS ==='],
+      ['Leads últimos 7 días', leadsUlt7],
+      [],
+      ['=== 📹 REELS ==='],
+      ['Reels grabados', reelsGrabados],
+      ['Reels publicados', reelsPublicados],
+      [],
+      ['=== 🎓 DE CERO A MARCA ==='],
+      ['Workshop', '19-20-21 mayo 2026 | 19:00 Bolivia'],
+      ['Precio completo', '$35 USD | Precio 1 día: $20 USD'],
       ['Metas en proceso', metas.filter(m => m['Estado'] === 'En proceso').length],
     ];
 
@@ -629,6 +688,7 @@ async function actualizarResumen(sheets) {
       spreadsheetId: SHEETS_ID, range: 'RESUMEN!A1',
       valueInputOption: 'USER_ENTERED', requestBody: { values: valores },
     });
+    console.log('✅ RESUMEN actualizado');
   } catch (e) { console.log('⚠️ No se pudo actualizar RESUMEN:', e.message); }
 }
 
