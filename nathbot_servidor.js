@@ -1,6 +1,6 @@
 // ╔══════════════════════════════════════════════════════╗
-// ║          NATHBOT — Servidor WhatsApp                 ║
-// ║  Nath escribe → Nathbot lee Sheets → responde        ║
+// ║          NATHBOT v2 — Claude completo en WhatsApp    ║
+// ║  Ve imágenes, razona, actualiza Sheets en tiempo real║
 // ╚══════════════════════════════════════════════════════╝
 const env = require('dotenv').config().parsed || {};
 const getEnv = (k) => process.env[k] || env[k];
@@ -9,6 +9,8 @@ const express = require('express');
 const { google } = require('googleapis');
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
+const https = require('https');
+const http = require('http');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -16,14 +18,14 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: getEnv('ANTHROPIC_API_KEY') });
 const SHEETS_ID = getEnv('SHEETS_ID');
-const NATH_WHATSAPP = getEnv('NATH_WHATSAPP_NUMBER');
+const TWILIO_SID = getEnv('TWILIO_ACCOUNT_SID');
+const TWILIO_TOKEN = getEnv('TWILIO_AUTH_TOKEN');
 
-// ── Historial en memoria (caché rápido) ───────────────────────────────────
-// { "whatsapp:+591xxx": [{role:"user"|"assistant", content:"..."}] }
+// ── Historial en memoria ──────────────────────────────────────────────────────
 const historialCache = {};
-const MAX_MENSAJES = 20; // 10 intercambios
+const MAX_MENSAJES = 30;
 
-// ── Google Sheets auth ────────────────────────────────────────────────────
+// ── Google Sheets auth ────────────────────────────────────────────────────────
 async function getSheetsClient() {
   const credsJson = getEnv('GOOGLE_CREDENTIALS');
   const credentials = credsJson ? JSON.parse(credsJson) : require('./google_service_account.json');
@@ -34,7 +36,6 @@ async function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// ── Leer una pestaña completa ─────────────────────────────────────────────
 async function leerHoja(sheets, hoja, rango = 'A1:Z200') {
   try {
     const res = await sheets.spreadsheets.values.get({
@@ -50,7 +51,6 @@ async function leerHoja(sheets, hoja, rango = 'A1:Z200') {
   } catch { return []; }
 }
 
-// ── Agregar fila a una hoja ───────────────────────────────────────────────
 async function agregarFila(sheets, hoja, valores) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEETS_ID,
@@ -60,64 +60,32 @@ async function agregarFila(sheets, hoja, valores) {
   });
 }
 
-// ── Cargar historial desde Sheets al arrancar ─────────────────────────────
-async function cargarHistorialDesdeSheets(sheets, from) {
-  try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEETS_ID,
-      range: 'HISTORIAL!A1:D500',
-    });
-    const filas = res.data.values || [];
-    if (filas.length < 2) return [];
-
-    // Filtrar por número y tomar los últimos MAX_MENSAJES
-    const mensajes = filas.slice(1)
-      .filter(f => f[1] === from)
-      .slice(-MAX_MENSAJES)
-      .map(f => ({ role: f[2], content: f[3] }));
-
-    return mensajes;
-  } catch {
-    return [];
-  }
+async function actualizarCelda(sheets, hoja, rango, valor) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEETS_ID,
+    range: `${hoja}!${rango}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[valor]] },
+  });
 }
 
-// ── Guardar mensaje en Sheets (async, no bloquea) ─────────────────────────
-async function guardarMensajeEnSheets(sheets, from, role, content) {
-  const ts = new Date().toISOString();
-  const resumen = content.length > 500 ? content.slice(0, 500) + '...' : content;
-  try {
-    await agregarFila(sheets, 'HISTORIAL', [ts, from, role, resumen]);
-  } catch (e) {
-    console.log('⚠️ No se pudo guardar en HISTORIAL:', e.message);
-  }
+// ── Descargar imagen de Twilio como base64 ────────────────────────────────────
+function descargarImagenBase64(url) {
+  return new Promise((resolve, reject) => {
+    const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
+    const lib = url.startsWith('https') ? https : http;
+    lib.get(url, { headers: { Authorization: `Basic ${auth}` } }, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+      res.on('error', reject);
+    }).on('error', reject);
+  });
 }
 
-// ── Obtener historial (caché → Sheets si vacío) ───────────────────────────
-async function obtenerHistorial(sheets, from) {
-  if (historialCache[from] && historialCache[from].length > 0) {
-    return historialCache[from];
-  }
-  // Si no hay caché (servidor recién arrancó), cargar de Sheets
-  const historial = await cargarHistorialDesdeSheets(sheets, from);
-  historialCache[from] = historial;
-  console.log(`📚 Historial cargado de Sheets: ${historial.length} mensajes`);
-  return historial;
-}
-
-// ── Agregar al historial local ────────────────────────────────────────────
-function agregarAlHistorialLocal(from, role, content) {
-  if (!historialCache[from]) historialCache[from] = [];
-  historialCache[from].push({ role, content });
-  // Limitar tamaño
-  if (historialCache[from].length > MAX_MENSAJES) {
-    historialCache[from] = historialCache[from].slice(-MAX_MENSAJES);
-  }
-}
-
-// ── Construir contexto del día para Claude ────────────────────────────────
+// ── Contexto del sistema Nathbot ──────────────────────────────────────────────
 async function construirContexto(sheets) {
-  const [bodas, tareas, finanzas, meDeben, metas, contenido, leads] = await Promise.all([
+  const [bodas, tareas, finanzas, meDeben, metas, contenido, leads, proyectos] = await Promise.all([
     leerHoja(sheets, 'BODAS'),
     leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
     leerHoja(sheets, 'FINANZAS', 'A1:E100'),
@@ -125,129 +93,353 @@ async function construirContexto(sheets) {
     leerHoja(sheets, 'METAS', 'A1:F50'),
     leerHoja(sheets, 'CONTENIDO', 'A1:H50'),
     leerHoja(sheets, 'LEADS', 'A1:H50'),
+    leerHoja(sheets, 'PROYECTOS', 'A1:H50'),
   ]);
 
   const hoy = new Date().toLocaleDateString('es-BO');
 
-  const bodasActivas = bodas.filter(b => b['Estado'] !== 'Completado');
-  const tareasHoy = tareas.filter(t => t['Completada'] !== 'Sí').slice(0, 10);
-  const cobros = meDeben.filter(d => d['Estado'] === 'Pendiente');
-  const leadsNuevos = leads.filter(l => l['Estado'] === 'Nuevo');
-
   return `
 HOY: ${hoy}
 
-BODAS ACTIVAS (${bodasActivas.length}):
-${bodasActivas.map(b => `- ${b['Pareja'] || b['Nombre'] || '?'} | ${b['Estado']} | Saldo: ${b['Saldo pendiente'] || b['Saldo pendiente (BOB)'] || 0} BOB | Boda: ${b['Fecha de boda'] || '?'}`).join('\n') || 'Ninguna'}
+BODAS ACTIVAS:
+${bodas.filter(b => b['Estado'] !== 'Completado').map(b =>
+    `- ${b['Pareja'] || b['Nombre'] || '?'} | ${b['Estado']} | Saldo: ${b['Saldo pendiente'] || b['Saldo pendiente (BOB)'] || 0} BOB | Fecha: ${b['Fecha de boda'] || '?'}`
+  ).join('\n') || 'Ninguna'}
 
-TAREAS PENDIENTES HOY (${tareasHoy.length}):
-${tareasHoy.map(t => `- [${t['Prioridad'] || 'Normal'}] ${t['Tarea'] || t['Nombre'] || '?'} | ${t['Categoria'] || ''}`).join('\n') || 'Ninguna'}
+PROYECTOS ACTIVOS:
+${proyectos.filter(p => p['Estado'] !== 'Completado').slice(0, 8).map(p =>
+    `- ${p['Nombre'] || p['Proyecto'] || '?'} | ${p['Estado'] || '?'} | ${p['Cliente'] || ''}`
+  ).join('\n') || 'Ninguno'}
 
-COBROS PENDIENTES (${cobros.length}):
-${cobros.map(c => `- ${c['Quien'] || '?'}: ${c['Monto (BOB)']} BOB`).join('\n') || 'Ninguno'}
+TAREAS PENDIENTES:
+${tareas.filter(t => t['Completada'] !== 'Sí').slice(0, 10).map(t =>
+    `- [${t['Prioridad'] || 'Normal'}] ${t['Tarea'] || t['Nombre'] || '?'} | ${t['Categoria'] || ''}`
+  ).join('\n') || 'Ninguna'}
 
-LEADS NUEVOS (${leadsNuevos.length}):
-${leadsNuevos.map(l => `- ${l['Nombre']}: ${l['Tipo de consulta']} via ${l['Fuente']}`).join('\n') || 'Ninguno'}
+COBROS PENDIENTES:
+${meDeben.filter(d => d['Estado'] === 'Pendiente').map(c =>
+    `- ${c['Quien'] || '?'}: ${c['Monto (BOB)']} BOB`
+  ).join('\n') || 'Ninguno'}
+
+LEADS NUEVOS:
+${leads.filter(l => l['Estado'] === 'Nuevo').map(l =>
+    `- ${l['Nombre']}: ${l['Tipo de consulta']} via ${l['Fuente']}`
+  ).join('\n') || 'Ninguno'}
 
 CONTENIDO EN PROCESO:
-${contenido.filter(c => c['Estado'] && c['Estado'] !== 'Publicado').slice(0, 5).map(c => `- ${c['Nombre / Hook'] || '?'} | ${c['Estado']} | ${c['Fecha publicacion'] || 'sin fecha'}`).join('\n') || 'Ninguno'}
+${contenido.filter(c => c['Estado'] && c['Estado'] !== 'Publicado').slice(0, 5).map(c =>
+    `- ${c['Nombre / Hook'] || '?'} | ${c['Estado']} | ${c['Fecha publicacion'] || 'sin fecha'}`
+  ).join('\n') || 'Ninguno'}
 
 METAS ACTIVAS:
-${metas.filter(m => m['Estado'] === 'En proceso').slice(0, 4).map(m => `- ${m['Meta']}: ${m['Progreso (%)'] || 0}%`).join('\n') || 'Ninguna'}
+${metas.filter(m => m['Estado'] === 'En proceso').slice(0, 4).map(m =>
+    `- ${m['Meta']}: ${m['Progreso (%)'] || 0}%`
+  ).join('\n') || 'Ninguna'}
 `.trim();
 }
 
-// ── Detectar si hay que actualizar alguna hoja ─────────────────────────────
-async function procesarAcciones(sheets, mensajeOriginal) {
-  const msg = mensajeOriginal.toLowerCase();
+// ── Herramientas de Claude para actualizar Sheets ─────────────────────────────
+const TOOLS = [
+  {
+    name: 'agregar_tarea',
+    description: 'Agrega una nueva tarea a TAREAS DIA en Google Sheets',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tarea: { type: 'string', description: 'Descripción de la tarea' },
+        prioridad: { type: 'string', enum: ['Alta', 'Media', 'Baja'], description: 'Prioridad de la tarea' },
+        categoria: { type: 'string', description: 'Categoría (ej: Edición, Marketing, Admin)' },
+      },
+      required: ['tarea'],
+    },
+  },
+  {
+    name: 'registrar_finanza',
+    description: 'Registra un ingreso o gasto en FINANZAS',
+    input_schema: {
+      type: 'object',
+      properties: {
+        descripcion: { type: 'string', description: 'Descripción del movimiento' },
+        tipo: { type: 'string', enum: ['Ingreso', 'Gasto'], description: 'Tipo de movimiento' },
+        monto: { type: 'number', description: 'Monto en BOB' },
+        categoria: { type: 'string', description: 'Categoría (ej: Boda, Servicio, Insumo)' },
+      },
+      required: ['descripcion', 'tipo', 'monto'],
+    },
+  },
+  {
+    name: 'agregar_lead',
+    description: 'Registra un nuevo lead o consulta de cliente potencial en LEADS',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nombre: { type: 'string', description: 'Nombre del lead' },
+        tipo_consulta: { type: 'string', description: 'Tipo de servicio que busca (boda, foto, video, etc)' },
+        fuente: { type: 'string', description: 'De dónde llegó (Instagram, WhatsApp, referido, etc)' },
+        notas: { type: 'string', description: 'Notas adicionales' },
+      },
+      required: ['nombre', 'tipo_consulta'],
+    },
+  },
+  {
+    name: 'agregar_nota_boda',
+    description: 'Agrega una nota o actualización a una boda existente en BODAS',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pareja: { type: 'string', description: 'Nombre de la pareja o boda' },
+        nota: { type: 'string', description: 'Nota o actualización a registrar' },
+      },
+      required: ['pareja', 'nota'],
+    },
+  },
+  {
+    name: 'registrar_cobro',
+    description: 'Registra un cobro pendiente en ME DEBEN',
+    input_schema: {
+      type: 'object',
+      properties: {
+        quien: { type: 'string', description: 'Nombre del cliente o persona' },
+        monto: { type: 'number', description: 'Monto en BOB' },
+        concepto: { type: 'string', description: 'Por qué concepto' },
+        fecha_limite: { type: 'string', description: 'Fecha límite de pago (DD/MM/YYYY)' },
+      },
+      required: ['quien', 'monto', 'concepto'],
+    },
+  },
+  {
+    name: 'marcar_tarea_completada',
+    description: 'Marca una tarea como completada en TAREAS DIA',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tarea: { type: 'string', description: 'Nombre o descripción de la tarea a marcar como completada' },
+      },
+      required: ['tarea'],
+    },
+  },
+];
 
-  if ((msg.includes('cobré') || msg.includes('pagué') || msg.includes('gasté') || msg.includes('recibí')) && /\d+/.test(msg)) {
-    const monto = msg.match(/\d+/)?.[0];
-    const tipo = (msg.includes('cobré') || msg.includes('recibí')) ? 'Ingreso' : 'Gasto';
-    const hoy = new Date().toISOString().split('T')[0];
-    await agregarFila(sheets, 'FINANZAS', [mensajeOriginal.slice(0, 40), tipo, 'Trabajo/Ingreso', hoy, monto]);
-    console.log(`💰 Finanzas: ${tipo} ${monto} BOB`);
+// ── Ejecutar herramienta de Claude ────────────────────────────────────────────
+async function ejecutarHerramienta(sheets, toolName, toolInput) {
+  const hoy = new Date().toISOString().split('T')[0];
+  console.log(`🔧 Ejecutando herramienta: ${toolName}`, toolInput);
+
+  switch (toolName) {
+    case 'agregar_tarea':
+      await agregarFila(sheets, 'TAREAS DIA', [
+        toolInput.tarea, toolInput.prioridad || 'Media', toolInput.categoria || '', hoy, 'No', '', ''
+      ]);
+      return `✅ Tarea agregada: "${toolInput.tarea}"`;
+
+    case 'registrar_finanza':
+      await agregarFila(sheets, 'FINANZAS', [
+        toolInput.descripcion, toolInput.tipo, toolInput.categoria || 'General', hoy, toolInput.monto
+      ]);
+      return `✅ ${toolInput.tipo} de ${toolInput.monto} BOB registrado`;
+
+    case 'agregar_lead':
+      await agregarFila(sheets, 'LEADS', [
+        toolInput.nombre, toolInput.tipo_consulta, toolInput.fuente || 'WhatsApp', hoy, 'Nuevo', toolInput.notas || '', '', ''
+      ]);
+      return `✅ Lead registrado: ${toolInput.nombre}`;
+
+    case 'agregar_nota_boda':
+      await agregarFila(sheets, 'BODAS', [
+        `[NOTA ${hoy}] ${toolInput.pareja}: ${toolInput.nota}`, '', '', '', '', '', '', ''
+      ]);
+      return `✅ Nota agregada a ${toolInput.pareja}`;
+
+    case 'registrar_cobro':
+      await agregarFila(sheets, 'ME DEBEN', [
+        toolInput.quien, toolInput.monto, toolInput.concepto, toolInput.fecha_limite || '', 'Pendiente'
+      ]);
+      return `✅ Cobro registrado: ${toolInput.quien} debe ${toolInput.monto} BOB`;
+
+    case 'marcar_tarea_completada': {
+      // Buscar la tarea y marcarla
+      const res = await sheets.spreadsheets.values.get({
+        spreadsheetId: SHEETS_ID,
+        range: 'TAREAS DIA!A1:G100',
+      });
+      const filas = res.data.values || [];
+      for (let i = 1; i < filas.length; i++) {
+        if (filas[i][0] && filas[i][0].toLowerCase().includes(toolInput.tarea.toLowerCase())) {
+          await actualizarCelda(sheets, 'TAREAS DIA', `E${i + 1}`, 'Sí');
+          return `✅ Tarea marcada como completada: "${filas[i][0]}"`;
+        }
+      }
+      return `⚠️ No encontré la tarea "${toolInput.tarea}" para marcarla`;
+    }
+
+    default:
+      return `⚠️ Herramienta desconocida: ${toolName}`;
   }
 }
 
-// ── Webhook de Twilio WhatsApp ─────────────────────────────────────────────
+// ── Historial ─────────────────────────────────────────────────────────────────
+async function obtenerHistorial(sheets, from) {
+  if (historialCache[from]?.length > 0) return historialCache[from];
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEETS_ID,
+      range: 'HISTORIAL!A1:D500',
+    });
+    const filas = res.data.values || [];
+    const mensajes = filas.slice(1)
+      .filter(f => f[1] === from)
+      .slice(-MAX_MENSAJES)
+      .map(f => ({ role: f[2], content: f[3] }));
+    historialCache[from] = mensajes;
+    return mensajes;
+  } catch { return []; }
+}
+
+function agregarAlHistorial(from, role, content) {
+  if (!historialCache[from]) historialCache[from] = [];
+  const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
+  historialCache[from].push({ role, content: contentStr });
+  if (historialCache[from].length > MAX_MENSAJES) {
+    historialCache[from] = historialCache[from].slice(-MAX_MENSAJES);
+  }
+}
+
+async function guardarHistorial(sheets, from, role, content) {
+  const ts = new Date().toISOString();
+  const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
+  try {
+    await agregarFila(sheets, 'HISTORIAL', [ts, from, role, contentStr.slice(0, 500)]);
+  } catch (e) {
+    console.log('⚠️ Error guardando historial:', e.message);
+  }
+}
+
+// ── Webhook principal ─────────────────────────────────────────────────────────
 app.post('/whatsapp', async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
 
   try {
     const from = req.body.From;
-    const mensaje = req.body.Body?.trim();
+    const texto = req.body.Body?.trim() || '';
+    const numMedia = parseInt(req.body.NumMedia || '0');
 
-    if (!mensaje) {
-      twiml.message('Hola Nath 👋');
-      return res.type('text/xml').send(twiml.toString());
-    }
-
-    console.log(`📱 Mensaje de ${from}: ${mensaje}`);
+    console.log(`📱 ${from}: "${texto}" | ${numMedia} imagen(es)`);
 
     const sheets = await getSheetsClient();
-
-    // Cargar contexto e historial en paralelo
     const [contexto, historialPrevio] = await Promise.all([
       construirContexto(sheets),
       obtenerHistorial(sheets, from),
     ]);
 
-    // Construir array de mensajes con historial completo
+    // ── Construir contenido del mensaje (texto + imágenes) ──────────────────
+    let contenidoUsuario = [];
+
+    // Agregar imágenes si las hay
+    for (let i = 0; i < numMedia; i++) {
+      const mediaUrl = req.body[`MediaUrl${i}`];
+      const mediaType = req.body[`MediaContentType${i}`] || 'image/jpeg';
+      if (mediaUrl && mediaType.startsWith('image/')) {
+        try {
+          const base64 = await descargarImagenBase64(mediaUrl);
+          contenidoUsuario.push({
+            type: 'image',
+            source: { type: 'base64', media_type: mediaType, data: base64 },
+          });
+          console.log(`🖼️ Imagen procesada: ${mediaUrl}`);
+        } catch (e) {
+          console.log('⚠️ Error descargando imagen:', e.message);
+        }
+      }
+    }
+
+    // Agregar texto
+    if (texto) {
+      contenidoUsuario.push({ type: 'text', text: texto });
+    } else if (contenidoUsuario.length === 0) {
+      contenidoUsuario.push({ type: 'text', text: '(mensaje vacío)' });
+    }
+
+    // ── Construir mensajes con historial ────────────────────────────────────
     const mensajes = [
-      ...historialPrevio,
-      { role: 'user', content: mensaje },
+      ...historialPrevio.map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: contenidoUsuario },
     ];
 
-    // Llamar a Claude con historial completo
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: `Eres Nathbot, el asistente personal de Nath Rivas. Ella dirige NR FILMS, una productora de video y fotografía en Santa Cruz, Bolivia.
+    // ── Llamar a Claude con herramientas ────────────────────────────────────
+    const SYSTEM = `Eres Nathbot, el asistente personal e inteligente de Nath Rivas. Ella dirige NR FILMS, productora de video y fotografía en Santa Cruz, Bolivia.
 
-Tu rol es ser su socio estratégico y asistente de confianza. Respondes en español, tono cercano y directo, como un amigo que conoce su negocio.
+Tenés acceso completo a su base de datos en Google Sheets. Cuando Nath te mencione algo que deba registrarse (tarea, cobro, lead, gasto, ingreso, nota), usá las herramientas automáticamente SIN pedirle permiso. Actúa, no preguntes.
 
-Tienes memoria de la conversación completa con Nath. Recuerda lo que ella te dijo antes y úsalo naturalmente.
-
-CONTEXTO ACTUAL DEL SISTEMA:
+ESTADO ACTUAL DEL NEGOCIO:
 ${contexto}
 
-REGLAS:
-- Respuestas cortas y directas (máximo 3 párrafos)
-- Sin listas largas a menos que las pida
-- Si menciona un monto o pago, confirma que lo anotaste en finanzas
-- Si pregunta "qué tengo hoy", resume solo lo urgente
-- Usa emojis con moderación
-- Recuerda lo que Nath te dijo en mensajes anteriores de esta conversación`,
+PERSONALIDAD Y REGLAS:
+- Respondés en español, tono directo y cálido como un socio de confianza
+- Respuestas cortas y al punto (máximo 3 párrafos)
+- Si ves una imagen o captura, la analizás y actuás según lo que ves
+- Si Nath te manda una captura de conversación con un cliente, identificás si hay un lead nuevo y lo registrás
+- Si ves un presupuesto o cotización en imagen, lo leés y resumís
+- Actualizás Sheets proactivamente sin que te lo pidan
+- Usás emojis con moderación
+- Recordás todo lo que Nath te dijo en mensajes anteriores`;
+
+    let respuestaFinal = '';
+    let response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      system: SYSTEM,
+      tools: TOOLS,
       messages: mensajes,
     });
 
-    const respuesta = response.content[0].text;
+    // ── Agentic loop: ejecutar herramientas hasta obtener respuesta final ───
+    while (response.stop_reason === 'tool_use') {
+      const toolUses = response.content.filter(b => b.type === 'tool_use');
+      const toolResults = [];
 
-    // Actualizar caché local
-    agregarAlHistorialLocal(from, 'user', mensaje);
-    agregarAlHistorialLocal(from, 'assistant', respuesta);
+      for (const toolUse of toolUses) {
+        const resultado = await ejecutarHerramienta(sheets, toolUse.name, toolUse.input);
+        toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: resultado });
+        respuestaFinal += resultado + '\n';
+      }
 
-    // Guardar en Sheets (async, no bloquea la respuesta)
+      // Continuar la conversación con los resultados
+      mensajes.push({ role: 'assistant', content: response.content });
+      mensajes.push({ role: 'user', content: toolResults });
+
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1024,
+        system: SYSTEM,
+        tools: TOOLS,
+        messages: mensajes,
+      });
+    }
+
+    // Texto final de Claude
+    const textoFinal = response.content.find(b => b.type === 'text')?.text || '';
+    if (textoFinal) respuestaFinal = textoFinal;
+
+    // ── Guardar en historial ────────────────────────────────────────────────
+    agregarAlHistorial(from, 'user', texto || '[imagen]');
+    agregarAlHistorial(from, 'assistant', respuestaFinal);
     Promise.all([
-      guardarMensajeEnSheets(sheets, from, 'user', mensaje),
-      guardarMensajeEnSheets(sheets, from, 'assistant', respuesta),
-      procesarAcciones(sheets, mensaje),
-    ]).catch(e => console.log('⚠️ Error guardando:', e.message));
+      guardarHistorial(sheets, from, 'user', texto || '[imagen]'),
+      guardarHistorial(sheets, from, 'assistant', respuestaFinal),
+    ]).catch(e => console.log('⚠️ Error historial:', e.message));
 
-    twiml.message(respuesta);
-    console.log(`🤖 Respuesta (${mensajes.length} msgs de historial): ${respuesta.slice(0, 80)}...`);
+    console.log(`🤖 Respuesta: ${respuestaFinal.slice(0, 100)}...`);
+    twiml.message(respuestaFinal.trim());
 
   } catch (err) {
-    console.error('Error:', err.message);
+    console.error('❌ Error:', err.message);
     twiml.message('Hubo un error. Intenta de nuevo Nath.');
   }
 
   res.type('text/xml').send(twiml.toString());
 });
 
-// ── Health check ──────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('🤖 Nathbot activo'));
+app.get('/', (req, res) => res.send('🤖 Nathbot v2 activo'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🤖 Nathbot servidor en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🤖 Nathbot v2 en puerto ${PORT}`));
