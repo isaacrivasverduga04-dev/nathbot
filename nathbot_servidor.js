@@ -16,7 +16,12 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: getEnv('ANTHROPIC_API_KEY') });
 const SHEETS_ID = getEnv('SHEETS_ID');
-const NATH_WHATSAPP = getEnv('NATH_WHATSAPP_NUMBER'); // ej: whatsapp:+59177777777
+const NATH_WHATSAPP = getEnv('NATH_WHATSAPP_NUMBER');
+
+// ── Historial en memoria (caché rápido) ───────────────────────────────────
+// { "whatsapp:+591xxx": [{role:"user"|"assistant", content:"..."}] }
+const historialCache = {};
+const MAX_MENSAJES = 20; // 10 intercambios
 
 // ── Google Sheets auth ────────────────────────────────────────────────────
 async function getSheetsClient() {
@@ -55,11 +60,65 @@ async function agregarFila(sheets, hoja, valores) {
   });
 }
 
+// ── Cargar historial desde Sheets al arrancar ─────────────────────────────
+async function cargarHistorialDesdeSheets(sheets, from) {
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEETS_ID,
+      range: 'HISTORIAL!A1:D500',
+    });
+    const filas = res.data.values || [];
+    if (filas.length < 2) return [];
+
+    // Filtrar por número y tomar los últimos MAX_MENSAJES
+    const mensajes = filas.slice(1)
+      .filter(f => f[1] === from)
+      .slice(-MAX_MENSAJES)
+      .map(f => ({ role: f[2], content: f[3] }));
+
+    return mensajes;
+  } catch {
+    return [];
+  }
+}
+
+// ── Guardar mensaje en Sheets (async, no bloquea) ─────────────────────────
+async function guardarMensajeEnSheets(sheets, from, role, content) {
+  const ts = new Date().toISOString();
+  const resumen = content.length > 500 ? content.slice(0, 500) + '...' : content;
+  try {
+    await agregarFila(sheets, 'HISTORIAL', [ts, from, role, resumen]);
+  } catch (e) {
+    console.log('⚠️ No se pudo guardar en HISTORIAL:', e.message);
+  }
+}
+
+// ── Obtener historial (caché → Sheets si vacío) ───────────────────────────
+async function obtenerHistorial(sheets, from) {
+  if (historialCache[from] && historialCache[from].length > 0) {
+    return historialCache[from];
+  }
+  // Si no hay caché (servidor recién arrancó), cargar de Sheets
+  const historial = await cargarHistorialDesdeSheets(sheets, from);
+  historialCache[from] = historial;
+  console.log(`📚 Historial cargado de Sheets: ${historial.length} mensajes`);
+  return historial;
+}
+
+// ── Agregar al historial local ────────────────────────────────────────────
+function agregarAlHistorialLocal(from, role, content) {
+  if (!historialCache[from]) historialCache[from] = [];
+  historialCache[from].push({ role, content });
+  // Limitar tamaño
+  if (historialCache[from].length > MAX_MENSAJES) {
+    historialCache[from] = historialCache[from].slice(-MAX_MENSAJES);
+  }
+}
+
 // ── Construir contexto del día para Claude ────────────────────────────────
 async function construirContexto(sheets) {
-  const [bodas, proyectos, tareas, finanzas, meDeben, metas, contenido, leads] = await Promise.all([
+  const [bodas, tareas, finanzas, meDeben, metas, contenido, leads] = await Promise.all([
     leerHoja(sheets, 'BODAS'),
-    leerHoja(sheets, 'PROYECTOS'),
     leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
     leerHoja(sheets, 'FINANZAS', 'A1:E100'),
     leerHoja(sheets, 'ME DEBEN', 'A1:E50'),
@@ -99,21 +158,15 @@ ${metas.filter(m => m['Estado'] === 'En proceso').slice(0, 4).map(m => `- ${m['M
 }
 
 // ── Detectar si hay que actualizar alguna hoja ─────────────────────────────
-async function procesarAcciones(sheets, respuesta, mensajeOriginal) {
+async function procesarAcciones(sheets, mensajeOriginal) {
   const msg = mensajeOriginal.toLowerCase();
 
-  // Detectar nuevo registro financiero
   if ((msg.includes('cobré') || msg.includes('pagué') || msg.includes('gasté') || msg.includes('recibí')) && /\d+/.test(msg)) {
     const monto = msg.match(/\d+/)?.[0];
     const tipo = (msg.includes('cobré') || msg.includes('recibí')) ? 'Ingreso' : 'Gasto';
     const hoy = new Date().toISOString().split('T')[0];
     await agregarFila(sheets, 'FINANZAS', [mensajeOriginal.slice(0, 40), tipo, 'Trabajo/Ingreso', hoy, monto]);
-  }
-
-  // Detectar tarea completada
-  if (msg.includes('completé') || msg.includes('terminé') || msg.includes('listo')) {
-    // Se podría actualizar TAREAS DIA aquí - por ahora solo log
-    console.log('📝 Acción detectada: tarea completada');
+    console.log(`💰 Finanzas: ${tipo} ${monto} BOB`);
   }
 }
 
@@ -132,11 +185,21 @@ app.post('/whatsapp', async (req, res) => {
 
     console.log(`📱 Mensaje de ${from}: ${mensaje}`);
 
-    // Construir contexto de Sheets
     const sheets = await getSheetsClient();
-    const contexto = await construirContexto(sheets);
 
-    // Llamar a Claude como Nathbot
+    // Cargar contexto e historial en paralelo
+    const [contexto, historialPrevio] = await Promise.all([
+      construirContexto(sheets),
+      obtenerHistorial(sheets, from),
+    ]);
+
+    // Construir array de mensajes con historial completo
+    const mensajes = [
+      ...historialPrevio,
+      { role: 'user', content: mensaje },
+    ];
+
+    // Llamar a Claude con historial completo
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
@@ -144,7 +207,7 @@ app.post('/whatsapp', async (req, res) => {
 
 Tu rol es ser su socio estratégico y asistente de confianza. Respondes en español, tono cercano y directo, como un amigo que conoce su negocio.
 
-Cuando Nath te cuente algo de su día (cobros, tareas, bodas, clientes), lo registras mentalmente y lo mencionas si es relevante.
+Tienes memoria de la conversación completa con Nath. Recuerda lo que ella te dijo antes y úsalo naturalmente.
 
 CONTEXTO ACTUAL DEL SISTEMA:
 ${contexto}
@@ -154,17 +217,26 @@ REGLAS:
 - Sin listas largas a menos que las pida
 - Si menciona un monto o pago, confirma que lo anotaste en finanzas
 - Si pregunta "qué tengo hoy", resume solo lo urgente
-- Usa emojis con moderación`,
-      messages: [{ role: 'user', content: mensaje }],
+- Usa emojis con moderación
+- Recuerda lo que Nath te dijo en mensajes anteriores de esta conversación`,
+      messages: mensajes,
     });
 
     const respuesta = response.content[0].text;
 
-    // Procesar acciones automáticas
-    await procesarAcciones(sheets, respuesta, mensaje);
+    // Actualizar caché local
+    agregarAlHistorialLocal(from, 'user', mensaje);
+    agregarAlHistorialLocal(from, 'assistant', respuesta);
+
+    // Guardar en Sheets (async, no bloquea la respuesta)
+    Promise.all([
+      guardarMensajeEnSheets(sheets, from, 'user', mensaje),
+      guardarMensajeEnSheets(sheets, from, 'assistant', respuesta),
+      procesarAcciones(sheets, mensaje),
+    ]).catch(e => console.log('⚠️ Error guardando:', e.message));
 
     twiml.message(respuesta);
-    console.log(`🤖 Respuesta: ${respuesta.slice(0, 80)}...`);
+    console.log(`🤖 Respuesta (${mensajes.length} msgs de historial): ${respuesta.slice(0, 80)}...`);
 
   } catch (err) {
     console.error('Error:', err.message);
