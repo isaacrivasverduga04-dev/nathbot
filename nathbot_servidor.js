@@ -20,8 +20,10 @@ const NATH_WHATSAPP = getEnv('NATH_WHATSAPP_NUMBER'); // ej: whatsapp:+591777777
 
 // ── Google Sheets auth ────────────────────────────────────────────────────
 async function getSheetsClient() {
+  const credsJson = getEnv('GOOGLE_CREDENTIALS');
+  const credentials = credsJson ? JSON.parse(credsJson) : require('./google_service_account.json');
   const auth = new google.auth.GoogleAuth({
-    keyFile: './google_service_account.json',
+    credentials,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
   return google.sheets({ version: 'v4', auth });
