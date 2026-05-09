@@ -439,6 +439,115 @@ PERSONALIDAD Y REGLAS:
   res.type('text/xml').send(twiml.toString());
 });
 
+// ── Generar y enviar resumen diario por WhatsApp ──────────────────────────────
+async function enviarResumenDia() {
+  const sheets = await getSheetsClient();
+  const contexto = await construirContexto(sheets);
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1024,
+    system: `Sos Nathbot, asistente de Nath Rivas (NR FILMS, Santa Cruz, Bolivia).
+Generás el resumen diario para WhatsApp. Formato compacto, directo, en español.
+Usá emojis para separar secciones. Máximo 10 líneas en total. Solo lo urgente e importante.`,
+    messages: [{
+      role: 'user',
+      content: `Con este contexto del negocio, generá el resumen del día para enviar por WhatsApp a Nath.
+Incluí: qué tiene pendiente hoy, cobros urgentes, próximas fechas importantes, y UNA sugerencia de acción prioritaria.
+No incluyas secciones vacías.
+
+${contexto}`,
+    }],
+  });
+
+  const resumen = response.content[0].text;
+
+  // Generar tareas del día en Sheets automáticamente
+  await generarTareasDelDia(sheets);
+
+  // Enviar por WhatsApp via Twilio
+  const client = twilio(TWILIO_SID, TWILIO_TOKEN);
+  const NATH_NUM = getEnv('NATH_WHATSAPP_NUMBER');
+  await client.messages.create({
+    from: 'whatsapp:+14155238886',
+    to: NATH_NUM,
+    body: `🤖 *Nathbot — Resumen del día*\n\n${resumen}`,
+  });
+
+  console.log('📤 Resumen diario enviado a Nath');
+  return resumen;
+}
+
+// ── Generar tareas automáticas del día en Sheets ──────────────────────────────
+async function generarTareasDelDia(sheets) {
+  try {
+    const hoy = new Date().toISOString().split('T')[0];
+    const [bodas, tareas, contenido, meDeben] = await Promise.all([
+      leerHoja(sheets, 'BODAS'),
+      leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
+      leerHoja(sheets, 'CONTENIDO', 'A1:H50'),
+      leerHoja(sheets, 'ME DEBEN', 'A1:E50'),
+    ]);
+
+    // Evitar duplicar tareas auto-generadas de hoy
+    const tareasHoy = tareas.filter(t => t['Fecha'] === hoy && t['Auto generada'] === 'Sí');
+    if (tareasHoy.length > 0) return; // Ya generadas hoy
+
+    const nuevasTareas = [];
+
+    // Bodas en entrega → tarea de edición
+    bodas.filter(b => b['Estado']?.match(/entrega/i)).forEach(b => {
+      const pareja = b['Pareja'] || b['Nombre'] || '?';
+      const saldo = b['Saldo pendiente'] || b['Saldo pendiente (BOB)'] || 0;
+      const bloqueada = b['Estado']?.match(/bloqueada/i);
+      nuevasTareas.push([
+        `${bloqueada ? 'URGENTE cobrar y entregar' : 'Editar y entregar'}: ${pareja}`,
+        bloqueada ? 'Urgente' : 'Alta', 'Edicion', hoy, 'No',
+        bloqueada ? `Cobrar ${saldo} BOB primero` : '', 'Sí'
+      ]);
+    });
+
+    // Cobros bloqueados → tarea urgente
+    bodas.filter(b => b['Estado']?.match(/bloqueada/i)).forEach(b => {
+      const pareja = b['Pareja'] || b['Nombre'] || '?';
+      const saldo = b['Saldo pendiente'] || b['Saldo pendiente (BOB)'] || 0;
+      nuevasTareas.push([`URGENTE cobrar ${saldo} BOB — ${pareja}`, 'Urgente', 'Administracion', hoy, 'No', '', 'Sí']);
+    });
+
+    // Cobros pendientes de ME DEBEN
+    meDeben.filter(d => d['Estado'] === 'Pendiente').slice(0, 3).forEach(d => {
+      nuevasTareas.push([`Cobrar a ${d['Quien'] || '?'}: ${d['Monto (BOB)']} BOB`, 'Alta', 'Administracion', hoy, 'No', d['Concepto'] || '', 'Sí']);
+    });
+
+    // Contenido programado hoy
+    contenido.filter(c => c['Fecha publicacion'] === hoy && c['Estado'] !== 'Publicado').forEach(c => {
+      nuevasTareas.push([`Publicar hoy: ${c['Nombre / Hook'] || '?'}`, 'Alta', 'Marketing', hoy, 'No', '', 'Sí']);
+    });
+
+    for (const tarea of nuevasTareas) {
+      await agregarFila(sheets, 'TAREAS DIA', tarea);
+    }
+    console.log(`📋 ${nuevasTareas.length} tareas auto-generadas para hoy`);
+  } catch (e) {
+    console.log('⚠️ Error generando tareas:', e.message);
+  }
+}
+
+// ── Endpoint para cron externo (cada 4 horas) ─────────────────────────────────
+app.get('/resumen-dia', async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== (getEnv('CRON_SECRET') || 'nathbot2026')) {
+    return res.status(401).send('No autorizado');
+  }
+  try {
+    const resumen = await enviarResumenDia();
+    res.json({ ok: true, resumen });
+  } catch (e) {
+    console.error('❌ Error resumen:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get('/', (req, res) => res.send('🤖 Nathbot v2 activo'));
 
 const PORT = process.env.PORT || 3000;
