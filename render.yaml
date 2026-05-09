@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: nathbot
+    env: node
+    buildCommand: npm install
+    startCommand: node nathbot_servidor.js
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SHEETS_ID
+        value: 1Qjux9G2jeKaLh1s_9M_4DZTgHz3mBT4FMDavS-e3fac
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: NATH_WHATSAPP_NUMBER
+        sync: false
