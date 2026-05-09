@@ -155,7 +155,7 @@ async function transcribirAudio(mediaUrl) {
 
 // ── Contexto del negocio desde Sheets ────────────────────────────────────────
 async function construirContexto(sheets) {
-  const [bodas, tareas, finanzas, meDeben, debo, metas, contenido, leads, proyectos] = await Promise.all([
+  const [bodas, tareas, finanzas, meDeben, debo, metas, contenido, leads, proyectos, marketing, proyectosNuevos] = await Promise.all([
     leerHoja(sheets, 'BODAS'),
     leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
     leerHoja(sheets, 'FINANZAS', 'A1:E100'),
@@ -165,6 +165,8 @@ async function construirContexto(sheets) {
     leerHoja(sheets, 'CONTENIDO', 'A1:H50'),
     leerHoja(sheets, 'LEADS', 'A1:F50'),
     leerHoja(sheets, 'PROYECTOS', 'A1:J50'),
+    leerHoja(sheets, 'MARKETING', 'A1:L50'),
+    leerHoja(sheets, 'PROYECTOS NUEVOS', 'A1:H30'),
   ]);
 
   const hoy = new Date().toLocaleDateString('es-BO');
@@ -194,11 +196,20 @@ ${bodas.filter(b => b['Estado'] && !b['Estado'].match(/completad/i)).map(b => {
   return `- ${b['Pareja'] || '?'} | ${b['Estado']} | Saldo: ${b['Saldo pendiente'] || 0} BOB | Boda: ${fecha || '?'} | Pendiente: ${b['Entregas pendientes'] || 'nada'}`;
 }).join('\n') || 'Ninguna'}
 
-PROYECTOS ACTIVOS:
+PROYECTOS BODAS (seguimiento):
 ${proyectos.filter(p => p['Estado'] && !p['Estado'].match(/completad/i)).slice(0, 6).map(p => {
-  const fecha = serialAFecha(p['Fecha de boda']);
-  return `- ${p['Pareja'] || p['Nombre'] || '?'} | ${p['Estado'] || '?'} | Saldo: ${p['Saldo pendiente (BOB)'] || 0} BOB | Boda: ${fecha || '?'}`;
+  return `- ${p['Pareja'] || '?'} | ${p['Estado'] || '?'} | Saldo: ${p['Saldo pendiente (BOB)'] || 0} BOB | Boda: ${p['Fecha de boda'] || '?'} | Pendiente: ${p['Entregas pendientes'] || 'nada'}`;
 }).join('\n') || 'Ninguno'}
+
+PROYECTOS NUEVOS (pipeline):
+${proyectosNuevos.filter(p => p['Estado'] && !p['Estado'].match(/completad/i)).slice(0, 5).map(p =>
+  `- ${p['Proyecto'] || '?'} | ${p['Estado']} | ${p['Fecha objetivo'] || '?'}`
+).join('\n') || 'Ninguno'}
+
+MARKETING — CAMPAÑAS ACTIVAS:
+${marketing.filter(m => m['Estado'] === 'Activa').map(m =>
+  `- ${m['Campaña']} | Plataforma: ${m['Plataforma']} | Presupuesto: ${m['Presupuesto (BOB)']} BOB | Gastado: ${m['Gastado (BOB)']} BOB | Leads: ${m['Leads']} | Conv: ${m['Conversiones']}`
+).join('\n') || 'Ninguna activa'}
 
 TAREAS PENDIENTES HOY:
 ${tareas.filter(t => t['Completada'] !== 'Sí').slice(0, 12).map(t =>
@@ -361,6 +372,30 @@ const TOOLS = [
       notas: { type: 'string' },
     }, required: ['meta'] },
   },
+  {
+    name: 'actualizar_marketing',
+    description: 'Actualiza métricas de una campaña de marketing (leads, gastado, conversiones)',
+    input_schema: { type: 'object', properties: {
+      campana: { type: 'string', description: 'Nombre o parte del nombre de la campaña' },
+      leads: { type: 'number' },
+      gastado: { type: 'number' },
+      conversiones: { type: 'number' },
+      estado: { type: 'string' },
+      notas: { type: 'string' },
+    }, required: ['campana'] },
+  },
+  {
+    name: 'agregar_proyecto_nuevo',
+    description: 'Agrega un proyecto nuevo al pipeline en PROYECTOS NUEVOS',
+    input_schema: { type: 'object', properties: {
+      proyecto: { type: 'string' },
+      tipo: { type: 'string' },
+      cliente: { type: 'string' },
+      valor_estimado: { type: 'number' },
+      fecha_objetivo: { type: 'string' },
+      notas: { type: 'string' },
+    }, required: ['proyecto'] },
+  },
 ];
 
 async function ejecutarHerramienta(sheets, name, input) {
@@ -475,6 +510,31 @@ async function ejecutarHerramienta(sheets, name, input) {
           input.fecha_limite || '', input.categoria || '', input.notas || '',
         ]);
         return `✅ Meta agregada: "${input.meta}"`;
+
+      case 'actualizar_marketing': {
+        // Columnas MARKETING: Campaña(A), Plataforma(B), Objetivo(C), Presupuesto(D), Gastado(E), Leads(F), Conversiones(G), CPL(H), Estado(I), Fecha inicio(J), Fecha fin(K), Notas(L)
+        const filas = await leerFilasBrutas(sheets, 'MARKETING', 'A1:L50');
+        for (let i = 1; i < filas.length; i++) {
+          if ((filas[i][0] || '').toLowerCase().includes(input.campana.toLowerCase())) {
+            const cambios = [];
+            if (input.leads !== undefined) { await actualizarCelda(sheets, 'MARKETING', `F${i+1}`, input.leads); cambios.push(`Leads: ${input.leads}`); }
+            if (input.gastado !== undefined) { await actualizarCelda(sheets, 'MARKETING', `E${i+1}`, input.gastado); cambios.push(`Gastado: ${input.gastado} BOB`); }
+            if (input.conversiones !== undefined) { await actualizarCelda(sheets, 'MARKETING', `G${i+1}`, input.conversiones); cambios.push(`Conv: ${input.conversiones}`); }
+            if (input.estado) { await actualizarCelda(sheets, 'MARKETING', `I${i+1}`, input.estado); cambios.push(`Estado: ${input.estado}`); }
+            if (input.notas) { await actualizarCelda(sheets, 'MARKETING', `L${i+1}`, input.notas); cambios.push('Nota actualizada'); }
+            return `✅ Campaña "${filas[i][0]}" actualizada: ${cambios.join(', ')}`;
+          }
+        }
+        return `⚠️ No encontré campaña: "${input.campana}"`;
+      }
+
+      case 'agregar_proyecto_nuevo':
+        // Columnas PROYECTOS NUEVOS: Proyecto, Tipo, Cliente, Estado, Valor estimado, Fecha objetivo, Responsable, Notas
+        await agregarFila(sheets, 'PROYECTOS NUEVOS', [
+          input.proyecto, input.tipo || '', input.cliente || '', 'En planificacion',
+          input.valor_estimado || 0, input.fecha_objetivo || '', 'Nath', input.notas || '',
+        ]);
+        return `✅ Proyecto nuevo agregado: "${input.proyecto}"`;
 
       default:
         return `⚠️ Herramienta desconocida: ${name}`;
