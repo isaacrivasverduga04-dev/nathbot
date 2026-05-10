@@ -155,7 +155,7 @@ async function transcribirAudio(mediaUrl) {
 
 // ── Contexto del negocio desde Sheets ────────────────────────────────────────
 async function construirContexto(sheets) {
-  const [bodas, tareas, finanzas, meDeben, debo, metas, contenido, leads, proyectos, marketing, proyectosNuevos, reels, workshop] = await Promise.all([
+  const [bodas, tareas, finanzas, meDeben, debo, metas, contenido, leads, proyectos, marketing, proyectosNuevos, canciones] = await Promise.all([
     leerHoja(sheets, 'BODAS'),
     leerHoja(sheets, 'TAREAS DIA', 'A1:G100'),
     leerHoja(sheets, 'FINANZAS', 'A1:E100'),
@@ -167,8 +167,7 @@ async function construirContexto(sheets) {
     leerHoja(sheets, 'PROYECTOS', 'A1:J50'),
     leerHoja(sheets, 'MARKETING', 'A1:L50'),
     leerHoja(sheets, 'PROYECTOS NUEVOS', 'A1:H30'),
-    leerHoja(sheets, 'SEGUIMIENTO REELS', 'A1:H20'),
-    leerHoja(sheets, 'DE CERO A MARCA', 'A1:B50'),
+    leerHoja(sheets, 'MÚSICA', 'A10:K15'),
   ]);
 
   const hoy = new Date().toLocaleDateString('es-BO');
@@ -245,6 +244,11 @@ METAS ACTIVAS:
 ${metas.filter(m => m['Estado'] === 'En proceso').slice(0, 5).map(m =>
   `- ${m['Meta']}: ${m['Progreso (%)'] || 0}% | Fecha: ${m['Fecha limite'] || '?'}`
 ).join('\n') || 'Ninguna'}
+
+ECO INTERNO (banda musical de Nath — reuniones Lunes y Viernes 5pm):
+${canciones.filter(c => c['Cancion'] && c['Cancion'] !== 'Cancion').map(c =>
+  `- ${c['Cancion']} | ${c['Estado']} | Maqueta: ${c['Maqueta lista'] || 'No'} | Bloqueada: ${c['Bloqueada?'] || 'No'} | ${c['Notas'] || ''}`
+).join('\n') || 'Sin canciones cargadas aun'}
 
 SEGUIMIENTO REELS (producción de contenido):
 ${reels.slice(0, 12).map(r =>
@@ -397,6 +401,28 @@ const TOOLS = [
     }, required: ['campana'] },
   },
   {
+    name: 'actualizar_cancion',
+    description: 'Actualiza el estado o notas de una cancion de ECO INTERNO en la tab MUSICA',
+    input_schema: { type: 'object', properties: {
+      cancion: { type: 'string', description: 'Nombre de la cancion' },
+      estado: { type: 'string', description: 'Nuevo estado (ej: Maqueta completa, En produccion, Lista, Lanzada)' },
+      bloqueada: { type: 'string', description: 'Si/No' },
+      motivo_bloqueo: { type: 'string' },
+      notas: { type: 'string' },
+    }, required: ['cancion'] },
+  },
+  {
+    name: 'registrar_reunion_banda',
+    description: 'Registra el resultado de una reunion de ECO INTERNO (lunes o viernes 5pm)',
+    input_schema: { type: 'object', properties: {
+      fecha: { type: 'string' },
+      avances: { type: 'string' },
+      bloqueados: { type: 'string' },
+      proximos_pasos: { type: 'string' },
+      asistentes: { type: 'string' },
+    }, required: ['avances'] },
+  },
+  {
     name: 'agregar_proyecto_nuevo',
     description: 'Agrega un proyecto nuevo al pipeline en PROYECTOS NUEVOS',
     input_schema: { type: 'object', properties: {
@@ -522,6 +548,40 @@ async function ejecutarHerramienta(sheets, name, input) {
           input.fecha_limite || '', input.categoria || '', input.notas || '',
         ]);
         return `✅ Meta agregada: "${input.meta}"`;
+
+      case 'actualizar_cancion': {
+        // Canciones en MÚSICA filas 10-15 (headers en fila 10: Cancion, Estado, Maqueta lista, Con productor, Fecha lanzamiento, CTA ManyChat, Pre-saves, Streams, Bloqueada?, Motivo bloqueo, Notas)
+        const filas = await leerFilasBrutas(sheets, 'MÚSICA', 'A10:K20');
+        const headers = filas[0] || [];
+        const estadoCol = headers.indexOf('Estado'); // B
+        const bloqCol = headers.indexOf('Bloqueada?'); // I
+        const motivoCol = headers.indexOf('Motivo bloqueo'); // J
+        const notasCol = headers.indexOf('Notas'); // K
+        for (let i = 1; i < filas.length; i++) {
+          if ((filas[i][0] || '').toLowerCase().includes(input.cancion.toLowerCase())) {
+            const rowNum = 10 + i;
+            const cambios = [];
+            if (input.estado) { await actualizarCelda(sheets, 'MÚSICA', `B${rowNum}`, input.estado); cambios.push(`Estado: ${input.estado}`); }
+            if (input.bloqueada) { await actualizarCelda(sheets, 'MÚSICA', `I${rowNum}`, input.bloqueada); cambios.push(`Bloqueada: ${input.bloqueada}`); }
+            if (input.motivo_bloqueo) { await actualizarCelda(sheets, 'MÚSICA', `J${rowNum}`, input.motivo_bloqueo); cambios.push('Motivo actualizado'); }
+            if (input.notas) {
+              const notaActual = filas[i][notasCol] || '';
+              const nuevaNota = notaActual ? `${notaActual} | [${hoy}] ${input.notas}` : input.notas;
+              await actualizarCelda(sheets, 'MÚSICA', `K${rowNum}`, nuevaNota); cambios.push('Nota agregada');
+            }
+            return `✅ Cancion "${filas[i][0]}" actualizada: ${cambios.join(', ')}`;
+          }
+        }
+        return `⚠️ No encontre la cancion: "${input.cancion}"`;
+      }
+
+      case 'registrar_reunion_banda': {
+        // Reuniones en MÚSICA desde fila 26 aprox: Fecha, Dia, Avances clave, Bloqueados, Proximos pasos, Asistentes
+        const fecha = input.fecha || hoy;
+        const dia = new Date().toLocaleDateString('es-BO', { weekday: 'long' });
+        await agregarFila(sheets, 'MÚSICA', [fecha, dia + ' 5pm', input.avances || '', input.bloqueados || '', input.proximos_pasos || '', input.asistentes || 'Nath']);
+        return `✅ Reunion banda registrada: ${fecha}`;
+      }
 
       case 'actualizar_marketing': {
         // Columnas MARKETING: Campaña(A), Plataforma(B), Objetivo(C), Presupuesto(D), Gastado(E), Leads(F), Conversiones(G), CPL(H), Estado(I), Fecha inicio(J), Fecha fin(K), Notas(L)
